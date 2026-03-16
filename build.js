@@ -2,6 +2,16 @@
 
 const esbuild = require('esbuild');
 
+// Client bundle (browser IIFE)
+esbuild.buildSync({
+  entryPoints: ['src/client/index.ts'],
+  bundle: true,
+  format: 'iife',
+  outfile: 'dist/client.js',
+  target: 'es2018',
+});
+
+// Server bundle (Node.js CJS)
 esbuild.buildSync({
   entryPoints: ['src/server/index.ts'],
   bundle: true,

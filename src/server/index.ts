@@ -9,6 +9,8 @@ import { slimCharacter } from './slim';
 import { writeToUpstream } from './proxy';
 import { handleWriteDatabase, handleWriteRemote } from './write-handler';
 import { reconcileDatabaseBin, reconcileRemoteFile } from './reconcile';
+import { handleProxy2, handleGetActiveJobs, handleJobStream, handleJobAbort, handleJobConsume } from './stream-buffer';
+import { getClientJs, injectScriptTag } from './client-bundle';
 import { RisuSaveType, type HydrationState } from '../shared/types';
 
 // --- Route classification ---
@@ -16,6 +18,9 @@ import { RisuSaveType, type HydrationState } from '../shared/types';
 const REMOTE_FILE_RE = /^remotes\/(.+)\.local\.bin$/;
 const COLDSTORAGE_RE = /^coldstorage\/(.+)$/;
 const DATABASE_BIN = 'database/database.bin';
+const JOB_STREAM_RE = /^\/db\/jobs\/([^/]+)\/stream$/;
+const JOB_ABORT_RE = /^\/db\/jobs\/([^/]+)\/abort$/;
+const JOB_CONSUME_RE = /^\/db\/jobs\/([^/]+)\/consume$/;
 
 type Route =
   | { type: 'read-database' }
@@ -23,33 +28,72 @@ type Route =
   | { type: 'read-coldstorage'; key: string }
   | { type: 'write-database' }
   | { type: 'write-remote'; charId: string }
+  | { type: 'proxy2' }
+  | { type: 'db-client-js' }
+  | { type: 'db-jobs-active' }
+  | { type: 'db-job-stream'; jobId: string }
+  | { type: 'db-job-abort'; jobId: string }
+  | { type: 'db-job-consume'; jobId: string }
+  | { type: 'root-html' }
   | { type: 'passthrough' };
 
 function classifyRequest(req: http.IncomingMessage): Route {
-  if (req.url !== '/api/read' && req.url !== '/api/write') {
-    return { type: 'passthrough' };
+  const url = req.url || '';
+
+  // DB Proxy endpoints
+  if (url === '/db/client.js' && req.method === 'GET') {
+    return { type: 'db-client-js' };
+  }
+  if (url === '/db/jobs/active' && req.method === 'GET') {
+    return { type: 'db-jobs-active' };
   }
 
-  const filePath = decodeFilePath(req);
-  if (!filePath) return { type: 'passthrough' };
-
-  const isRead = req.method === 'GET';
-  const isWrite = req.method === 'POST';
-
-  if (filePath === DATABASE_BIN) {
-    if (isRead) return { type: 'read-database' };
-    if (isWrite) return { type: 'write-database' };
+  const streamMatch = url.match(JOB_STREAM_RE);
+  if (streamMatch && req.method === 'GET') {
+    return { type: 'db-job-stream', jobId: streamMatch[1] };
+  }
+  const abortMatch = url.match(JOB_ABORT_RE);
+  if (abortMatch && req.method === 'POST') {
+    return { type: 'db-job-abort', jobId: abortMatch[1] };
+  }
+  const consumeMatch = url.match(JOB_CONSUME_RE);
+  if (consumeMatch && req.method === 'POST') {
+    return { type: 'db-job-consume', jobId: consumeMatch[1] };
   }
 
-  const remoteMatch = filePath.match(REMOTE_FILE_RE);
-  if (remoteMatch) {
-    if (isRead) return { type: 'read-remote', charId: remoteMatch[1] };
-    if (isWrite) return { type: 'write-remote', charId: remoteMatch[1] };
+  // proxy2
+  if ((url === '/proxy2' || url.startsWith('/proxy2?')) && req.method === 'POST') {
+    return { type: 'proxy2' };
   }
 
-  const coldMatch = filePath.match(COLDSTORAGE_RE);
-  if (coldMatch && isRead) {
-    return { type: 'read-coldstorage', key: coldMatch[1] };
+  // Root HTML (for script injection)
+  if (url === '/' && req.method === 'GET') {
+    return { type: 'root-html' };
+  }
+
+  // File API routes
+  if (url === '/api/read' || url === '/api/write') {
+    const filePath = decodeFilePath(req);
+    if (filePath) {
+      const isRead = req.method === 'GET';
+      const isWrite = req.method === 'POST';
+
+      if (filePath === DATABASE_BIN) {
+        if (isRead) return { type: 'read-database' };
+        if (isWrite) return { type: 'write-database' };
+      }
+
+      const remoteMatch = filePath.match(REMOTE_FILE_RE);
+      if (remoteMatch) {
+        if (isRead) return { type: 'read-remote', charId: remoteMatch[1] };
+        if (isWrite) return { type: 'write-remote', charId: remoteMatch[1] };
+      }
+
+      const coldMatch = filePath.match(COLDSTORAGE_RE);
+      if (coldMatch && isRead) {
+        return { type: 'read-coldstorage', key: coldMatch[1] };
+      }
+    }
   }
 
   return { type: 'passthrough' };
@@ -71,10 +115,6 @@ function checkHydrationComplete(): void {
   }
 }
 
-/**
- * Capture database.bin from upstream response and populate SQLite.
- * Called via tee pattern on the first client read.
- */
 function captureDatabaseBin(body: Buffer, authHeader: string | undefined): void {
   if (!isDbReady()) return;
   const db = getDb();
@@ -88,8 +128,6 @@ function captureDatabaseBin(body: Buffer, authHeader: string | undefined): void 
   inTransaction(db, () => {
     for (const block of result.blocks) {
       upsertBlock(db, block.name, block.type, 'database.bin', block.compression, block.data, block.hash);
-
-      // Track REMOTE pointers to know how many remotes to expect
       if (block.type === RisuSaveType.REMOTE) {
         const ptr = parseRemotePointer(block.data);
         if (ptr) expectedRemoteCount++;
@@ -102,19 +140,10 @@ function captureDatabaseBin(body: Buffer, authHeader: string | undefined): void 
     `[DB-Proxy] database.bin captured: ${result.blocks.length} blocks, ` +
       `${expectedRemoteCount} remotes expected. State: WARMING`,
   );
-
   checkHydrationComplete();
 }
 
-/**
- * Capture a remote character file and slim it for future reads.
- * Cold storage entries are written to upstream for FS consistency.
- */
-function captureRemoteFile(
-  body: Buffer,
-  charId: string,
-  authHeader: string | undefined,
-): void {
+function captureRemoteFile(body: Buffer, charId: string, authHeader: string | undefined): void {
   if (!isDbReady()) return;
   const db = getDb();
 
@@ -126,24 +155,12 @@ function captureRemoteFile(
   const slimBuffer = Buffer.from(slimJson, 'utf-8');
 
   inTransaction(db, () => {
-    // Store slim character data
-    upsertBlock(
-      db,
-      `remote:${charId}`,
-      RisuSaveType.CHARACTER_WITH_CHAT,
-      `remote:${charId}`,
-      0,
-      slimBuffer,
-      block.hash,
-    );
-
-    // Store cold entries
+    upsertBlock(db, `remote:${charId}`, RisuSaveType.CHARACTER_WITH_CHAT, `remote:${charId}`, 0, slimBuffer, block.hash);
     for (const entry of coldEntries) {
       upsertChat(db, entry.uuid, entry.charId, entry.chatIndex, entry.compressed, entry.hash);
     }
   });
 
-  // Write cold storage to upstream for FS self-consistency (fire-and-forget)
   for (const entry of coldEntries) {
     writeToUpstream(`coldstorage/${entry.uuid}`, entry.compressed, authHeader);
   }
@@ -154,20 +171,10 @@ function captureRemoteFile(
 
 // --- Read handlers ---
 
-function handleReadDatabase(
-  req: http.IncomingMessage,
-  res: http.ServerResponse,
-): void {
+function handleReadDatabase(req: http.IncomingMessage, res: http.ServerResponse): void {
   const db = getDb();
-
-  // In Node server mode, database.bin only has CONFIG/ROOT/BOTPRESET/MODULES/REMOTE blocks.
-  // These are small. We reassemble from SQLite as-is (no slim needed for database.bin).
   const rows = getBlocksBySource(db, 'database.bin');
-
-  if (rows.length === 0) {
-    // No data yet — bypass
-    throw new Error('No database.bin blocks in cache');
-  }
+  if (rows.length === 0) throw new Error('No database.bin blocks in cache');
 
   const binary = assembleRisuSave(
     rows.map((r) => ({
@@ -178,51 +185,71 @@ function handleReadDatabase(
     })),
   );
 
-  res.writeHead(200, {
-    'content-type': 'application/octet-stream',
-    'content-length': String(binary.length),
-  });
+  res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': String(binary.length) });
   res.end(binary);
 }
 
-function handleReadRemote(
-  req: http.IncomingMessage,
-  res: http.ServerResponse,
-  charId: string,
-): void {
+function handleReadRemote(req: http.IncomingMessage, res: http.ServerResponse, charId: string): void {
   const db = getDb();
-
   const block = getBlock(db, `remote:${charId}`);
-  if (!block) {
-    throw new Error(`Remote ${charId} not in cache`);
-  }
+  if (!block) throw new Error(`Remote ${charId} not in cache`);
 
-  // block.data is the slim character JSON
-  res.writeHead(200, {
-    'content-type': 'application/octet-stream',
-    'content-length': String(block.data.length),
-  });
+  res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': String(block.data.length) });
   res.end(block.data);
 }
 
-function handleReadColdStorage(
-  req: http.IncomingMessage,
-  res: http.ServerResponse,
-  key: string,
-): void {
+function handleReadColdStorage(req: http.IncomingMessage, res: http.ServerResponse, key: string): void {
   const db = getDb();
-
   const chat = getChat(db, key);
-  if (!chat) {
-    throw new Error(`Cold storage ${key} not in cache`);
-  }
+  if (!chat) throw new Error(`Cold storage ${key} not in cache`);
 
-  // chat.data is already gzip-compressed (fflate-compatible)
-  res.writeHead(200, {
-    'content-type': 'application/octet-stream',
-    'content-length': String(chat.data.length),
-  });
+  res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': String(chat.data.length) });
   res.end(chat.data);
+}
+
+// --- HTML injection handler ---
+
+function handleRootHtml(req: http.IncomingMessage, res: http.ServerResponse): void {
+  const proxyReq = http.request(
+    {
+      hostname: UPSTREAM.hostname,
+      port: UPSTREAM.port,
+      path: req.url,
+      method: req.method,
+      headers: { ...req.headers, host: UPSTREAM.host },
+    },
+    (proxyRes) => {
+      const contentType = proxyRes.headers['content-type'] || '';
+
+      if (!contentType.includes('text/html')) {
+        // Not HTML — pass through
+        res.writeHead(proxyRes.statusCode!, proxyRes.headers);
+        proxyRes.pipe(res);
+        return;
+      }
+
+      // Buffer HTML, inject script tag
+      const chunks: Buffer[] = [];
+      proxyRes.on('data', (chunk: Buffer) => chunks.push(chunk));
+      proxyRes.on('end', () => {
+        let html = Buffer.concat(chunks).toString('utf-8');
+        html = injectScriptTag(html);
+
+        const headers = { ...proxyRes.headers };
+        headers['content-length'] = String(Buffer.byteLength(html));
+        delete headers['content-encoding']; // Injected content is not compressed
+        res.writeHead(proxyRes.statusCode!, headers);
+        res.end(html);
+      });
+    },
+  );
+
+  req.pipe(proxyReq);
+  proxyReq.on('error', (err) => {
+    console.error('[DB-Proxy] root HTML proxy error:', err.message);
+    if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain' });
+    res.end('Bad Gateway');
+  });
 }
 
 // --- Server ---
@@ -230,7 +257,6 @@ function handleReadColdStorage(
 const cb = createCircuitBreaker();
 
 function main(): void {
-  // Initialize SQLite (best-effort; if it fails, we run in pure proxy mode)
   try {
     initDb();
     console.log('[DB-Proxy] SQLite initialized');
@@ -242,6 +268,75 @@ function main(): void {
     const route = classifyRequest(req);
 
     switch (route.type) {
+      // --- DB Proxy endpoints ---
+      case 'db-client-js': {
+        const js = getClientJs();
+        res.writeHead(200, {
+          'content-type': 'application/javascript',
+          'content-length': String(Buffer.byteLength(js)),
+          'cache-control': 'no-cache',
+        });
+        res.end(js);
+        return;
+      }
+
+      case 'db-jobs-active': {
+        if (!isDbReady()) {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ jobs: [] }));
+          return;
+        }
+        handleGetActiveJobs(req, res, getDb());
+        return;
+      }
+
+      case 'db-job-stream': {
+        if (!isDbReady()) {
+          res.writeHead(404, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'DB not ready' }));
+          return;
+        }
+        handleJobStream(req, res, route.jobId, getDb());
+        return;
+      }
+
+      case 'db-job-abort': {
+        if (!isDbReady()) {
+          res.writeHead(404, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'DB not ready' }));
+          return;
+        }
+        handleJobAbort(req, res, route.jobId, getDb());
+        return;
+      }
+
+      case 'db-job-consume': {
+        if (!isDbReady()) {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ success: true }));
+          return;
+        }
+        handleJobConsume(req, res, route.jobId, getDb());
+        return;
+      }
+
+      // --- proxy2 ---
+      case 'proxy2': {
+        if (isDbReady()) {
+          handleProxy2(req, res, getDb());
+        } else {
+          forwardRequest(req, res);
+        }
+        return;
+      }
+
+      // --- HTML injection ---
+      case 'root-html': {
+        handleRootHtml(req, res);
+        return;
+      }
+
+      // --- File API routes ---
       case 'read-database': {
         const canAccelerate = isDbReady() && hydrationState !== 'COLD' && cb.allowRequest();
         if (canAccelerate) {
@@ -254,21 +349,13 @@ function main(): void {
             console.error('[DB-Proxy] read-database fallback:', (err as Error).message);
           }
         }
-        // Bypass: tee for hydration or reconciliation
-        const dbAuthHeader = typeof req.headers['risu-auth'] === 'string'
-          ? req.headers['risu-auth']
-          : undefined;
+        const dbAuthHeader = typeof req.headers['risu-auth'] === 'string' ? req.headers['risu-auth'] : undefined;
         forwardAndTee(req, res, (status, body) => {
           if (status < 200 || status >= 300 || body.length === 0 || !isDbReady()) return;
           try {
-            if (hydrationState === 'HOT') {
-              reconcileDatabaseBin(getDb(), body);
-            } else {
-              captureDatabaseBin(body, dbAuthHeader);
-            }
-          } catch (e) {
-            console.error('[DB-Proxy] capture/reconcile database.bin error:', e);
-          }
+            if (hydrationState === 'HOT') reconcileDatabaseBin(getDb(), body);
+            else captureDatabaseBin(body, dbAuthHeader);
+          } catch (e) { console.error('[DB-Proxy] capture/reconcile database.bin error:', e); }
         });
         return;
       }
@@ -285,21 +372,13 @@ function main(): void {
             console.error('[DB-Proxy] read-remote fallback:', (err as Error).message);
           }
         }
-        // Bypass: tee for hydration or reconciliation
-        const remoteAuthHeader = typeof req.headers['risu-auth'] === 'string'
-          ? req.headers['risu-auth']
-          : undefined;
+        const remoteAuthHeader = typeof req.headers['risu-auth'] === 'string' ? req.headers['risu-auth'] : undefined;
         forwardAndTee(req, res, (status, body) => {
           if (status < 200 || status >= 300 || body.length === 0 || !isDbReady()) return;
           try {
-            if (hydrationState === 'HOT') {
-              reconcileRemoteFile(getDb(), body, route.charId, remoteAuthHeader);
-            } else {
-              captureRemoteFile(body, route.charId, remoteAuthHeader);
-            }
-          } catch (e) {
-            console.error('[DB-Proxy] capture/reconcile remote error:', e);
-          }
+            if (hydrationState === 'HOT') reconcileRemoteFile(getDb(), body, route.charId, remoteAuthHeader);
+            else captureRemoteFile(body, route.charId, remoteAuthHeader);
+          } catch (e) { console.error('[DB-Proxy] capture/reconcile remote error:', e); }
         });
         return;
       }
@@ -316,19 +395,14 @@ function main(): void {
             console.error('[DB-Proxy] read-coldstorage fallback:', (err as Error).message);
           }
         }
-        // Bypass
         forwardRequest(req, res);
         return;
       }
 
       case 'write-database': {
         if (isDbReady()) {
-          try {
-            handleWriteDatabase(req, res, getDb());
-            return;
-          } catch (err) {
-            console.error('[DB-Proxy] write-database handler error, bypassing:', (err as Error).message);
-          }
+          try { handleWriteDatabase(req, res, getDb()); return; }
+          catch (err) { console.error('[DB-Proxy] write-database error, bypassing:', (err as Error).message); }
         }
         forwardRequest(req, res);
         return;
@@ -336,12 +410,8 @@ function main(): void {
 
       case 'write-remote': {
         if (isDbReady()) {
-          try {
-            handleWriteRemote(req, res, route.charId, getDb());
-            return;
-          } catch (err) {
-            console.error('[DB-Proxy] write-remote handler error, bypassing:', (err as Error).message);
-          }
+          try { handleWriteRemote(req, res, route.charId, getDb()); return; }
+          catch (err) { console.error('[DB-Proxy] write-remote error, bypassing:', (err as Error).message); }
         }
         forwardRequest(req, res);
         return;
@@ -358,6 +428,7 @@ function main(): void {
     console.log(`[DB-Proxy] Listening on :${PORT}`);
     console.log(`[DB-Proxy] Upstream: ${UPSTREAM.protocol}//${UPSTREAM.host}`);
     console.log(`[DB-Proxy] Hydration: ${hydrationState}`);
+    console.log(`[DB-Proxy] Stream buffer: enabled`);
   });
 }
 

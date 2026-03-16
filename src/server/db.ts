@@ -38,6 +38,16 @@ export function initDb(): Database.Database {
     CREATE INDEX IF NOT EXISTS idx_blocks_type ON blocks(type);
     CREATE INDEX IF NOT EXISTS idx_blocks_source ON blocks(source);
     CREATE INDEX IF NOT EXISTS idx_chats_char ON chats(char_id);
+
+    CREATE TABLE IF NOT EXISTS jobs (
+      id          TEXT PRIMARY KEY,
+      char_id     TEXT,
+      status      TEXT NOT NULL DEFAULT 'streaming',
+      response    TEXT NOT NULL DEFAULT '',
+      error       TEXT,
+      created_at  INTEGER DEFAULT (unixepoch()),
+      updated_at  INTEGER DEFAULT (unixepoch())
+    );
   `);
 
   _db = db;
@@ -176,6 +186,73 @@ export function getChatsByCharId(
 
 export function deleteChatsByCharId(db: Database.Database, charId: string): void {
   stmt(db, 'delete_chats_by_char', 'DELETE FROM chats WHERE char_id = ?').run(charId);
+}
+
+// --- Job CRUD ---
+
+export function createJob(
+  db: Database.Database,
+  id: string,
+  charId: string | null,
+): void {
+  stmt(
+    db,
+    'create_job',
+    `INSERT INTO jobs (id, char_id, status, response, created_at, updated_at)
+     VALUES (?, ?, 'streaming', '', unixepoch(), unixepoch())`,
+  ).run(id, charId);
+}
+
+export function appendJobResponse(
+  db: Database.Database,
+  id: string,
+  text: string,
+): void {
+  stmt(
+    db,
+    'append_job_response',
+    `UPDATE jobs SET response = ?, updated_at = unixepoch() WHERE id = ?`,
+  ).run(text, id);
+}
+
+export function updateJobStatus(
+  db: Database.Database,
+  id: string,
+  status: string,
+  error?: string,
+): void {
+  stmt(
+    db,
+    'update_job_status',
+    `UPDATE jobs SET status = ?, error = ?, updated_at = unixepoch() WHERE id = ?`,
+  ).run(status, error ?? null, id);
+}
+
+export function getJob(
+  db: Database.Database,
+  id: string,
+): { id: string; char_id: string | null; status: string; response: string; error: string | null; created_at: number; updated_at: number } | undefined {
+  return stmt(
+    db,
+    'get_job',
+    'SELECT id, char_id, status, response, error, created_at, updated_at FROM jobs WHERE id = ?',
+  ).get(id) as ReturnType<typeof getJob>;
+}
+
+export function getActiveJobs(
+  db: Database.Database,
+): Array<{ id: string; char_id: string | null; status: string; response: string; error: string | null; created_at: number; updated_at: number }> {
+  return stmt(
+    db,
+    'get_active_jobs',
+    `SELECT id, char_id, status, response, error, created_at, updated_at
+     FROM jobs WHERE status IN ('streaming', 'completed', 'failed')
+     ORDER BY created_at DESC`,
+  ).all() as ReturnType<typeof getActiveJobs>;
+}
+
+export function deleteJob(db: Database.Database, id: string): void {
+  stmt(db, 'delete_job', 'DELETE FROM jobs WHERE id = ?').run(id);
 }
 
 // --- Transaction helper ---
