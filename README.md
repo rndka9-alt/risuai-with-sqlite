@@ -33,10 +33,51 @@ Client → DB-Proxy (:3001) → Sync (:3000) → RisuAI (:6001) → Filesystem
 
 | 원칙 | 설명 |
 |------|------|
+| Bypass-first | DB Proxy의 기본 동작은 투명 프록시. SQLite 가속은 부가 기능. 처리 중 실패 시 upstream 직통 |
 | Write-through | 쓰기 → DB 업데이트 → upstream forward (FS 기록은 RisuAI가 담당) |
 | Read from DB | 읽기 → DB에서 서빙. 초기 hydrate 이후 upstream 안 감 |
 | FS = Boot source of truth | 기동 시 FS의 데이터를 파싱해서 DB hydrate |
 | API 투명성 | `/api/read`, `/api/write` 인터페이스 불변. 클라이언트 수정 없음 |
+
+## Failure Bypass
+
+DB Proxy는 **실패 시 upstream 직통**을 보장한다.
+
+### 요청 단위 bypass
+
+모든 요청 핸들러는 try-catch로 감싸져 있으며,
+SQLite 조회/파싱/재조립 중 어떤 단계에서든 실패하면 즉시 upstream으로 원본 요청을 forward한다.
+
+```
+Client → DB-Proxy
+           ├─ [성공] SQLite에서 처리 → 응답
+           └─ [실패] catch → upstream forward → 응답 (투명 프록시 동작)
+```
+
+### Circuit breaker
+
+연속 N회 실패 시 일정 시간 동안 전체 bypass 모드로 전환:
+
+```
+상태: CLOSED (정상)
+  → 요청마다 SQLite 가속 시도
+  → 실패 시 fallback + 실패 카운터 증가
+
+상태: OPEN (bypass 모드)
+  → 모든 요청을 upstream 직통
+  → 일정 시간(예: 30초) 후 HALF-OPEN
+
+상태: HALF-OPEN (탐색)
+  → 단일 요청만 SQLite 시도
+  → 성공 → CLOSED, 실패 → OPEN
+```
+
+### Hydration 실패
+
+기동 시 upstream에서 데이터를 가져오지 못하면:
+- SQLite 없이 **순수 프록시 모드**로 시작
+- 백그라운드에서 주기적으로 hydration 재시도
+- hydration 성공 시 자동으로 가속 모드 전환
 
 ## 데이터 흐름
 
@@ -119,6 +160,8 @@ src/
 ├── server/
 │   ├── index.ts          # HTTP 프록시 서버, 라우팅
 │   ├── config.ts         # 환경변수 로딩
+│   ├── proxy.ts          # upstream forward (bypass의 기본 동작)
+│   ├── circuit-breaker.ts # 실패 감지, bypass 모드 전환
 │   ├── db.ts             # SQLite 연결, CRUD, 마이그레이션
 │   ├── parser.ts         # RisuSave 바이너리 파싱
 │   ├── assembler.ts      # 블록 → RisuSave 바이너리 재조립
@@ -156,6 +199,34 @@ docker run -p 3001:3001 \
   -v risu-db-data:/data \
   risu-db-proxy
 ```
+
+### 볼륨 마운트
+
+SQLite 파일은 **반드시 외부 마운트**해야 한다:
+
+```yaml
+# docker-compose.yml 예시
+services:
+  db-proxy:
+    build: .
+    ports:
+      - "3001:3001"
+    environment:
+      - UPSTREAM=http://risuai:6001
+      - DB_PATH=/data/proxy.db
+    volumes:
+      - db-proxy-data:/data        # Named volume (권장)
+      # - ./data:/data             # 또는 호스트 바인드 마운트
+
+volumes:
+  db-proxy-data:
+```
+
+| 저장소 | 위치 | 유실 시 |
+|--------|------|---------|
+| SQLite (proxy.db) | `/data/` (외부 마운트) | 기동 시 upstream에서 재hydrate. 데이터 유실 없음, 기동 시간만 증가 |
+| WAL 파일 (proxy.db-wal) | `/data/` (자동 생성) | SQLite가 자동 복구 |
+| upstream FS | RisuAI 컨테이너 `/app/save/` | Source of truth. 이건 유실되면 안 됨 |
 
 ## FS 정합성 보장
 

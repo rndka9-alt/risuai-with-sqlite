@@ -5,3 +5,13 @@ export const RECONCILE_INTERVAL_MS = parseInt(
   process.env.RECONCILE_INTERVAL_MS || '300000',
   10,
 );
+
+// Circuit breaker
+export const CB_FAILURE_THRESHOLD = parseInt(
+  process.env.CB_FAILURE_THRESHOLD || '5',
+  10,
+);
+export const CB_RESET_TIMEOUT_MS = parseInt(
+  process.env.CB_RESET_TIMEOUT_MS || '30000',
+  10,
+);
