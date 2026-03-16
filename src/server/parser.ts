@@ -1,0 +1,128 @@
+import crypto from 'crypto';
+import zlib from 'zlib';
+import { RisuSaveType, type ParsedBlock } from '../shared/types';
+
+const MAGIC_HEADER = Buffer.from('RISUSAVE\0', 'utf-8');
+
+const KNOWN_TYPES = new Set([0, 1, 2, 3, 4, 5, 6, 7, 8]);
+
+/**
+ * Parse a RisuSave binary (database.bin) into blocks.
+ * Unlike the sync server's parser, this INCLUDES REMOTE blocks
+ * and preserves raw data + compression flags.
+ */
+export function parseRisuSave(
+  buffer: Buffer,
+): { blocks: ParsedBlock[]; directory: string[] } | null {
+  if (buffer.length < MAGIC_HEADER.length) return null;
+  for (let i = 0; i < MAGIC_HEADER.length; i++) {
+    if (buffer[i] !== MAGIC_HEADER[i]) return null;
+  }
+
+  const blocks: ParsedBlock[] = [];
+  let directory: string[] = [];
+  let offset = MAGIC_HEADER.length;
+
+  while (offset + 7 <= buffer.length) {
+    try {
+      const rawType = buffer[offset];
+      const compression = buffer[offset + 1];
+      offset += 2;
+
+      if (!KNOWN_TYPES.has(rawType)) break;
+
+      const nameLen = buffer[offset];
+      offset += 1;
+
+      if (offset + nameLen + 4 > buffer.length) break;
+
+      const name = buffer.slice(offset, offset + nameLen).toString('utf-8');
+      offset += nameLen;
+
+      const dataLen = buffer.readUInt32LE(offset);
+      offset += 4;
+
+      if (offset + dataLen > buffer.length) break;
+
+      const rawData = buffer.slice(offset, offset + dataLen);
+      offset += dataLen;
+
+      let data: Buffer;
+      if (compression === 1) {
+        try {
+          data = zlib.gunzipSync(rawData);
+        } catch {
+          // Decompression failure: skip block
+          continue;
+        }
+      } else {
+        data = rawData;
+      }
+
+      const hash = crypto.createHash('sha256').update(data).digest('hex');
+
+      blocks.push({
+        name,
+        type: rawType as RisuSaveType,
+        compression: compression as 0 | 1,
+        data,
+        hash,
+      });
+
+      // Extract __directory from ROOT block
+      if (rawType === RisuSaveType.ROOT) {
+        try {
+          const rootData = JSON.parse(data.toString('utf-8'));
+          if (Array.isArray(rootData.__directory)) {
+            directory = rootData.__directory;
+          }
+        } catch {
+          // Ignore parse failure
+        }
+      }
+    } catch {
+      break;
+    }
+  }
+
+  return { blocks, directory };
+}
+
+/**
+ * Parse a remote character file (remotes/{chaId}.local.bin).
+ * Remote files are raw UTF-8 JSON text, NOT RisuSave-framed.
+ */
+export function parseRemoteFile(
+  buffer: Buffer,
+  charId: string,
+): ParsedBlock | null {
+  if (buffer.length === 0) return null;
+
+  const hash = crypto.createHash('sha256').update(buffer).digest('hex');
+
+  return {
+    name: charId,
+    type: RisuSaveType.CHARACTER_WITH_CHAT,
+    compression: 0,
+    data: buffer,
+    hash,
+  };
+}
+
+/**
+ * Extract REMOTE block metadata.
+ * REMOTE block data is JSON: { v: 1, type: number, name: string }
+ */
+export function parseRemotePointer(
+  data: Buffer,
+): { charId: string; originalType: RisuSaveType } | null {
+  try {
+    const meta = JSON.parse(data.toString('utf-8'));
+    if (meta.v === 1 && typeof meta.name === 'string') {
+      return { charId: meta.name, originalType: meta.type };
+    }
+  } catch {
+    // Ignore
+  }
+  return null;
+}

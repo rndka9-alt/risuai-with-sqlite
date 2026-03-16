@@ -14,14 +14,18 @@ export const enum RisuSaveType {
 export interface ParsedBlock {
   name: string;
   type: RisuSaveType;
+  compression: 0 | 1;
   data: Buffer;
   hash: string;
 }
 
-export interface ChatData {
-  key: string;
+export interface ChatEntry {
+  uuid: string;
   charId: string;
   chatIndex: number;
-  data: Buffer;
+  data: Buffer; // gzip-compressed chat JSON (fflate-compatible)
   hash: string;
 }
+
+/** Hydration state */
+export type HydrationState = 'COLD' | 'WARMING' | 'HOT';
