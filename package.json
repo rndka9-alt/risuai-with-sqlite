@@ -1,0 +1,20 @@
+{
+  "name": "risu-db-proxy",
+  "version": "0.1.0",
+  "private": true,
+  "dependencies": {
+    "better-sqlite3": "^11.8.2"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^25.5.0",
+    "esbuild": "^0.27.4",
+    "typescript": "^5.9.3"
+  },
+  "scripts": {
+    "build": "node build.js",
+    "start": "node dist/server.js",
+    "dev": "node build.js && node dist/server.js",
+    "typecheck": "tsc --noEmit"
+  }
+}
