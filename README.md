@@ -84,13 +84,11 @@ Client → DB-Proxy
 ### Proxy 기동
 
 ```
-1. SQLite 비어있음?
-   → upstream GET /api/read (database.bin) → 파싱 → SQLite hydrate
-   → 각 채팅 데이터를 upstream coldstorage에 write-back (FS 정합성)
-   → remote 캐릭터 파일도 fetch → SQLite 저장
-
-2. SQLite에 데이터 있음?
-   → Reconciliation: upstream과 hash 비교 → drift 시 FS 기준 갱신
+Lazy Hydration (클라이언트 트래픽 기반):
+1. COLD 상태로 시작 (SQLite 비어있음, 모든 요청 bypass)
+2. 첫 번째 read 요청 → tee로 upstream 응답 캡처 → SQLite에 저장 → WARMING
+3. 모든 remote 캐릭터 캡처 완료 → HOT (이후 SQLite에서 서빙)
+4. HOT 상태에서 bypass 발생 시 → hash 비교 → drift 보정 (passive reconciliation)
 ```
 
 ### Read Path
@@ -117,40 +115,33 @@ Client POST /api/write
 └─ 기타 → upstream 패스스루
 ```
 
-### Reconciliation (주기적)
-
-```
-매 N분:
-→ upstream에서 database.bin + remotes 읽기
-→ 블록별 hash 비교
-→ drift 발견 시 FS 기준으로 DB 갱신
-→ cold storage 파일 정합성 확인
-```
-
 ## DB 스키마
 
 SQLite (better-sqlite3), WAL 모드.
 
 ```sql
 CREATE TABLE blocks (
-  name       TEXT PRIMARY KEY,
-  type       INTEGER NOT NULL,
-  data       BLOB NOT NULL,
-  hash       TEXT NOT NULL,
-  updated_at INTEGER DEFAULT (unixepoch())
+  name        TEXT PRIMARY KEY,
+  type        INTEGER NOT NULL,
+  source      TEXT NOT NULL,       -- 'database.bin' or 'remote:{chaId}'
+  compression INTEGER NOT NULL DEFAULT 0,
+  data        BLOB NOT NULL,
+  hash        TEXT NOT NULL,
+  updated_at  INTEGER DEFAULT (unixepoch())
 );
 
 CREATE TABLE chats (
-  key        TEXT PRIMARY KEY,   -- '{chaId}_chat_{index}'
-  char_id    TEXT NOT NULL,
-  chat_index INTEGER NOT NULL,
-  data       BLOB NOT NULL,      -- fflate 압축된 채팅 JSON
-  hash       TEXT NOT NULL,
-  updated_at INTEGER DEFAULT (unixepoch())
+  uuid        TEXT PRIMARY KEY,    -- cold storage UUID
+  char_id     TEXT NOT NULL,
+  chat_index  INTEGER NOT NULL,
+  data        BLOB NOT NULL,       -- gzip 압축된 채팅 JSON (fflate 호환)
+  hash        TEXT NOT NULL,
+  updated_at  INTEGER DEFAULT (unixepoch())
 );
 
-CREATE INDEX idx_chats_char ON chats(char_id);
 CREATE INDEX idx_blocks_type ON blocks(type);
+CREATE INDEX idx_blocks_source ON blocks(source);
+CREATE INDEX idx_chats_char ON chats(char_id);
 ```
 
 ## 모듈 구조
@@ -168,7 +159,7 @@ src/
 │   ├── slim.ts           # Slim response 생성 (chat → cold marker)
 │   ├── write-handler.ts  # Write 인터셉트 (marker skip 로직)
 │   ├── cold-compat.ts    # Cold storage 호환 (fflate 압축/해제)
-│   └── reconcile.ts      # 주기적 FS↔DB 정합성 검사
+│   └── reconcile.ts      # Passive FS↔DB 정합성 검사 (bypass 시 hash 비교)
 └── shared/
     └── types.ts          # 공유 타입 정의
 ```
@@ -179,7 +170,8 @@ src/
 PORT=3001                        # DB Proxy 리슨 포트
 UPSTREAM=http://localhost:6001   # RisuAI (또는 Sync 서버) 주소
 DB_PATH=./data/proxy.db          # SQLite 파일 경로
-RECONCILE_INTERVAL_MS=300000     # 정합성 검사 주기 (기본 5분)
+CB_FAILURE_THRESHOLD=5           # Circuit breaker 실패 임계값
+CB_RESET_TIMEOUT_MS=30000        # Circuit breaker 리셋 타임아웃 (ms)
 ```
 
 ## 실행
@@ -234,6 +226,6 @@ DB Proxy가 없어도 데이터가 유실되지 않도록 설계:
 
 1. **Write-back**: Slim response 생성 시 채팅 데이터를 upstream의 `coldstorage/`에도 실제로 저장
 2. **Write-through**: 모든 쓰기를 upstream에 forward하여 FS에도 반영
-3. **Reconciliation**: 주기적으로 FS 상태와 DB 비교, FS 기준으로 보정
+3. **Passive reconciliation**: bypass 발생 시 upstream 응답과 SQLite의 hash를 비교, drift 보정
 
 → DB Proxy를 제거하더라도, FS에 cold storage 파일이 존재하므로 RisuAI가 정상 동작.
