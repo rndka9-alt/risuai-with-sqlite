@@ -451,7 +451,13 @@ function main(): void {
 
     res.on('finish', () => {
       const duration = (performance.now() - reqStart).toFixed(0);
-      log.info('Response', { rid, method: req.method, url: req.url, route: route.type, status: String(res.statusCode), ms: duration });
+      const logFields: Record<string, string | undefined> = { rid, method: req.method, url: req.url, route: route.type, status: String(res.statusCode), ms: duration };
+      // file-path 헤더가 있으면 디코딩해서 로그에 포함 (backup 이슈 추적용)
+      const rawFp = req.headers['file-path'];
+      if (typeof rawFp === 'string' && rawFp.length > 0) {
+        logFields.filePath = decodeFilePath(req) ?? rawFp;
+      }
+      log.info('Response', logFields);
     });
 
     switch (route.type) {

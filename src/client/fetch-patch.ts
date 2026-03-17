@@ -109,6 +109,22 @@ const patchedFetch: typeof fetch = function (input, init) {
     });
   }
 
+  // Invalidate /api/list cache when files change
+  // /api/remove is a GET with side effects — force cache bypass to prevent 304
+  if (input === '/api/remove') {
+    const bypassInit = { ...init, cache: 'no-store' as RequestCache };
+    return originalFetch.call(window, input, bypassInit).then((resp) => {
+      if (resp.ok) listCachePromise = null;
+      return resp;
+    });
+  }
+  if (input === '/api/write' && init?.method === 'POST') {
+    return originalFetch.call(window, input, init!).then((resp) => {
+      if (resp.ok) listCachePromise = null;
+      return resp;
+    });
+  }
+
   // Only intercept POST /proxy2
   if (init?.method === 'POST' && (input === '/proxy2' || (typeof input === 'string' && input.startsWith('/proxy2?')))) {
     if (!init.headers) init.headers = {};
