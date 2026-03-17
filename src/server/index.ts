@@ -1,6 +1,6 @@
 import crypto from 'crypto';
 import http from 'http';
-import { PORT, UPSTREAM } from './config';
+import { PORT, UPSTREAM, CLIENT_ID_HEADER } from './config';
 import { forwardRequest, forwardAndTee, forwardBufferAndTransform, decodeFilePath, fetchFromUpstream } from './proxy';
 import { createCircuitBreaker } from './circuit-breaker';
 import { initDb, resetDb, isDbReady, getDb, getBlock, getBlocksBySource, getAllRemoteBlocks, upsertBlock, upsertChat, upsertCharDetail, getCharDetail, getAllCharDetails, getChat, inTransaction } from './db';
@@ -447,9 +447,9 @@ function main(): void {
       || crypto.randomBytes(8).toString('hex');
     req.headers['x-request-id'] = rid;
 
-    // Ensure x-sync-client-id is always present — client patch may not be loaded
-    if (typeof req.headers['x-sync-client-id'] !== 'string') {
-      req.headers['x-sync-client-id'] = `srv-${crypto.randomBytes(8).toString('hex')}`;
+    // Ensure client ID header is always present — client patch may not be loaded
+    if (typeof req.headers[CLIENT_ID_HEADER] !== 'string') {
+      req.headers[CLIENT_ID_HEADER] = `srv-${crypto.randomBytes(8).toString('hex')}`;
     }
 
     log.debug('Request', { rid, method: req.method, url: req.url, route: route.type });

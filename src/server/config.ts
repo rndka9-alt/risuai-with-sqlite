@@ -14,6 +14,9 @@ export const DB_PATH = process.env.DB_PATH || './data/proxy.db';
 // Logging
 export const LOG_LEVEL = process.env.LOG_LEVEL || 'info';
 
+/** 프록시 모듈 간 공유하는 클라이언트 식별 헤더 */
+export const CLIENT_ID_HEADER = 'x-proxy-client-id';
+
 // Circuit breaker
 export const CB_FAILURE_THRESHOLD = parseInt(
   process.env.CB_FAILURE_THRESHOLD || '5',
