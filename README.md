@@ -14,6 +14,25 @@ DB Proxy는 이 파일시스템 레이어 앞에 SQLite를 두어:
 - **Write**: DB 업데이트 후 upstream에 forward (FS 정합성 유지)
 - **초기 로딩**: 캐릭터 이름/이미지만 전송, 나머지는 백그라운드 로딩
 
+## 필수 설정: Remote Saving 활성화
+
+DB Proxy의 핵심 최적화(Deep Slim, Batch Remotes 등)는 캐릭터 데이터가
+**개별 파일**(`remotes/{chaId}.local.bin`)로 저장되어야 동작한다.
+
+RisuAI는 Node 서버 모드에서도 **Remote Saving이 꺼져 있으면** 모든 캐릭터를
+`database.bin` 하나에 몰아서 저장한다.
+이 상태에서 DB Proxy는 투명 프록시 역할만 하며, 성능 이점이 거의 없다.
+
+**켜는 방법**: Settings → Advanced → **Enable Remote Saving** 체크
+
+| Remote Saving | 저장 방식 | DB Proxy 효과 |
+|:---:|---|---|
+| OFF (기본값) | 모든 캐릭터가 `database.bin` 하나에 포함 | 투명 프록시만 동작, 최적화 없음 |
+| **ON** | 캐릭터별 `remotes/*.local.bin` 분리 저장 | Deep Slim · Batch Remotes · Cold Storage 전부 활성 |
+
+> Remote Saving을 켠 뒤 최초 저장 시, 기존 `database.bin`에 내장되어 있던
+> 캐릭터 데이터가 개별 remote 파일로 마이그레이션된다. 이 과정은 자동이며 데이터 유실은 없다.
+
 ## 아키텍처
 
 ```
