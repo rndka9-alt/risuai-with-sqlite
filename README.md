@@ -12,7 +12,7 @@ RisuAI Node 서버 모드는 모든 데이터를 파일시스템에 저장한다
 DB Proxy는 이 파일시스템 레이어 앞에 SQLite를 두어:
 - **Read**: DB에서 즉시 서빙 (upstream 파일 I/O 회피)
 - **Write**: DB 업데이트 후 upstream에 forward (FS 정합성 유지)
-- **초기 로딩**: 캐릭터 메타데이터만 전송, 채팅은 on-demand 로딩
+- **초기 로딩**: 캐릭터 이름/이미지만 전송, 나머지는 백그라운드 로딩
 
 ## 아키텍처
 
@@ -96,24 +96,84 @@ Lazy Hydration (클라이언트 트래픽 기반):
 ```
 Client GET /api/read
 ├─ database.bin      → SQLite에서 slim 재조립 (채팅은 cold marker로 치환)
-├─ remotes/*.bin     → SQLite에서 slim 재조립
+├─ remotes/*.bin     → SQLite에서 deep-slim 재조립 (채팅 + 무거운 필드 모두 제거)
 ├─ coldstorage/*     → SQLite에서 채팅 데이터 서빙 (fflate 압축)
 └─ assets/*          → upstream 패스스루
 ```
 
-**Slim Response**: RisuAI의 기존 Cold Storage 메커니즘을 활용.
-채팅 메시지를 `\uEF01COLDSTORAGE\uEF01{id}` 마커로 교체하여 전송.
-클라이언트가 채팅을 열면 `preLoadChat()` → `/api/read (coldstorage/...)` 로 on-demand 로딩.
+**2-Phase Slim Response**:
+
+| Phase | 대상 | 처리 |
+|-------|------|------|
+| Chat Slim | `chats[]` 배열 | 채팅 메시지를 cold marker로 교체. 클라이언트의 `preLoadChat()` → `coldstorage/` 로 on-demand 로딩 |
+| Deep Slim | 31개 heavy fields | `desc`, `systemPrompt`, `globalLore`, `triggerscript` 등을 빈 값으로 교체. `char_details` 테이블에 gzip 압축 저장. `__strippedFields` 마커 배열 삽입 |
+
+Deep Slim 후 클라이언트에 전달되는 캐릭터 데이터:
+- 유지: `name`, `image`, `type`, `chaId`, `creatorNotes`, `tags`, `trashTime` 등 UI 표시용 필드
+- 제거: `desc`, `systemPrompt`, `personality`, `scenario`, `globalLore`, `firstMessage` 등 31개 필드
+- 클라이언트 JS가 백그라운드에서 `/db/char-details` 호출 → 메모리에 merge → `__strippedFields` 제거
 
 ### Write Path
 
 ```
 Client POST /api/write
-├─ database.bin / remotes/*.bin:
-│   파싱 → cold marker인 채팅은 skip, 실제 데이터면 DB update
-│   원본 blob → upstream forward
+├─ database.bin:
+│   파싱 → incremental block upsert → upstream forward
+├─ remotes/*.bin:
+│   1. __strippedFields 감지 시 → 저장된 detail과 merge하여 완전한 데이터 복원
+│   2. 복원된 데이터를 upstream에 forward (FS에는 항상 완전한 데이터 저장)
+│   3. Background: chat slim → deep slim → SQLite 저장
 └─ 기타 → upstream 패스스루
 ```
+
+`__strippedFields` merge는 클라이언트가 detail을 아직 로딩하지 않은 상태에서 저장해도 데이터 유실이 없도록 보장한다.
+
+### Streaming (proxy2)
+
+```
+Client POST /proxy2 (LLM 요청)
+  1. x-dbproxy-target-char 헤더로 대상 캐릭터 식별
+  2. job 생성 → SQLite에 저장
+  3. upstream forward → SSE 스트리밍 감지
+  4. 메모리 activeStreams에서 라이브 추적 + SQLite에 주기적 persist
+  5. 페이지 새로고침 시 GET /db/jobs/{id}/stream으로 SSE 재연결
+  6. 완료 후 POST /db/jobs/{id}/consume → 삭제
+```
+
+## 클라이언트 번들
+
+RisuAI HTML에 `<script defer src="/db/client.js">` 를 자동 주입한다.
+
+| 모듈 | 역할 |
+|------|------|
+| `fetch-patch.ts` | fetch 패치: `/proxy2` 요청에 target-char 헤더 주입, job ID 캡처 |
+| `detail-loader.ts` | 풀스크린 로딩 오버레이 + deep-slim detail 백그라운드 fetch → 메모리 merge |
+| `recovery.ts` | 페이지 새로고침 후 streaming job 복구 (SSE 재연결, 완료 job 적용) |
+| `notification.ts` | 토스트 알림 UI |
+
+`detail-loader`는 `__pluginApis__.getDatabase()`를 통해 RisuAI의 인메모리 DB에 직접 접근하여 stripped 필드를 복원한다. 로딩 완료 전까지 풀스크린 오버레이로 유저 인터렉션을 차단한다.
+
+## API 엔드포인트
+
+### File API (RisuAI 호환)
+
+| 경로 | 메서드 | 설명 |
+|------|--------|------|
+| `/api/read` | GET | 파일 읽기 (database.bin, remotes, coldstorage, assets) |
+| `/api/write` | POST | 파일 쓰기 (write-through + background slim) |
+
+### DB Proxy 전용
+
+| 경로 | 메서드 | 설명 |
+|------|--------|------|
+| `/db/client.js` | GET | 클라이언트 번들 (IIFE) |
+| `/db/char-detail/{charId}` | GET | 개별 캐릭터의 stripped detail 반환 (JSON) |
+| `/db/char-details` | GET | 전체 캐릭터 detail 일괄 반환 (JSON) |
+| `/db/jobs/active` | GET | 활성 streaming job 목록 |
+| `/db/jobs/{id}/stream` | GET | SSE 재연결 (replay + live) |
+| `/db/jobs/{id}/abort` | POST | 스트리밍 중단 |
+| `/db/jobs/{id}/consume` | POST | job 삭제 |
+| `/proxy2` | POST | LLM 스트리밍 프록시 (SSE 버퍼링 + job 관리) |
 
 ## DB 스키마
 
@@ -139,6 +199,23 @@ CREATE TABLE chats (
   updated_at  INTEGER DEFAULT (unixepoch())
 );
 
+CREATE TABLE char_details (
+  char_id     TEXT PRIMARY KEY,    -- 캐릭터 ID
+  data        BLOB NOT NULL,       -- gzip 압축된 heavy fields JSON
+  hash        TEXT NOT NULL,
+  updated_at  INTEGER DEFAULT (unixepoch())
+);
+
+CREATE TABLE jobs (
+  id          TEXT PRIMARY KEY,    -- streaming job UUID
+  char_id     TEXT,                -- 대상 캐릭터
+  status      TEXT NOT NULL DEFAULT 'streaming',  -- streaming/completed/failed/aborted
+  response    TEXT NOT NULL DEFAULT '',
+  error       TEXT,
+  created_at  INTEGER DEFAULT (unixepoch()),
+  updated_at  INTEGER DEFAULT (unixepoch())
+);
+
 CREATE INDEX idx_blocks_type ON blocks(type);
 CREATE INDEX idx_blocks_source ON blocks(source);
 CREATE INDEX idx_chats_char ON chats(char_id);
@@ -148,20 +225,30 @@ CREATE INDEX idx_chats_char ON chats(char_id);
 
 ```
 src/
+├── client/                    # 브라우저 IIFE 번들 (RisuAI HTML에 주입)
+│   ├── index.ts              # 진입점: fetch-patch + detail-loader + recovery 연결
+│   ├── fetch-patch.ts        # fetch 패치 (proxy2에 target-char 헤더 주입)
+│   ├── detail-loader.ts      # 풀스크린 오버레이 + deep-slim detail 백그라운드 로딩
+│   ├── recovery.ts           # 페이지 새로고침 후 streaming job 복구
+│   └── notification.ts       # 토스트 UI
 ├── server/
-│   ├── index.ts          # HTTP 프록시 서버, 라우팅
-│   ├── config.ts         # 환경변수 로딩
-│   ├── proxy.ts          # upstream forward (bypass의 기본 동작)
-│   ├── circuit-breaker.ts # 실패 감지, bypass 모드 전환
-│   ├── db.ts             # SQLite 연결, CRUD, 마이그레이션
-│   ├── parser.ts         # RisuSave 바이너리 파싱
-│   ├── assembler.ts      # 블록 → RisuSave 바이너리 재조립
-│   ├── slim.ts           # Slim response 생성 (chat → cold marker)
-│   ├── write-handler.ts  # Write 인터셉트 (marker skip 로직)
-│   ├── cold-compat.ts    # Cold storage 호환 (fflate 압축/해제)
-│   └── reconcile.ts      # Passive FS↔DB 정합성 검사 (bypass 시 hash 비교)
+│   ├── index.ts              # HTTP 프록시 서버, 라우팅, hydration 상태 관리
+│   ├── config.ts             # 환경변수 로딩
+│   ├── proxy.ts              # upstream forward (bypass의 기본 동작)
+│   ├── circuit-breaker.ts    # 실패 감지, bypass 모드 전환
+│   ├── db.ts                 # SQLite 연결, CRUD (blocks, chats, char_details, jobs)
+│   ├── parser.ts             # RisuSave 바이너리 파싱
+│   ├── assembler.ts          # 블록 → RisuSave 바이너리 재조립
+│   ├── slim.ts               # Chat cold storage + Deep slim (31개 heavy fields 분리)
+│   ├── write-handler.ts      # Write 인터셉트 (__strippedFields merge + re-slim)
+│   ├── cold-compat.ts        # Cold storage 호환 (fflate 압축/해제)
+│   ├── reconcile.ts          # Passive FS↔DB 정합성 검사 (bypass 시 hash 비교)
+│   ├── stream-buffer.ts      # /proxy2 SSE 스트리밍 + job 관리
+│   ├── client-bundle.ts      # client.js 로딩 + HTML script 주입
+│   ├── parser.test.ts        # parser 테스트
+│   └── slim.test.ts          # slim/deepSlim/merge 테스트
 └── shared/
-    └── types.ts          # 공유 타입 정의
+    └── types.ts              # RisuSaveType enum, ParsedBlock, Job 등 공유 타입
 ```
 
 ## 설정
@@ -181,6 +268,16 @@ npm install
 npm run build
 npm start
 ```
+
+## 테스트
+
+```bash
+npm test             # vitest run (전체)
+npm run test:watch   # vitest watch 모드
+npm run typecheck    # tsc --noEmit
+```
+
+테스트 파일은 소스 옆에 co-locate한다 (`slim.ts` → `slim.test.ts`).
 
 ## Docker
 
@@ -226,6 +323,7 @@ DB Proxy가 없어도 데이터가 유실되지 않도록 설계:
 
 1. **Write-back**: Slim response 생성 시 채팅 데이터를 upstream의 `coldstorage/`에도 실제로 저장
 2. **Write-through**: 모든 쓰기를 upstream에 forward하여 FS에도 반영
-3. **Passive reconciliation**: bypass 발생 시 upstream 응답과 SQLite의 hash를 비교, drift 보정
+3. **Detail merge**: `__strippedFields`가 있는 write 요청은 저장된 detail과 merge 후 upstream에 전달 → FS에 항상 완전한 데이터 보장
+4. **Passive reconciliation**: bypass 발생 시 upstream 응답과 SQLite의 hash를 비교, drift 보정
 
 → DB Proxy를 제거하더라도, FS에 cold storage 파일이 존재하므로 RisuAI가 정상 동작.
