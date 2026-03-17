@@ -1,12 +1,17 @@
 /**
- * Background detail loader: after initial page load, fetch heavy character
- * fields stripped by deep-slim and merge them back into the in-memory database.
+ * Detail loader with full-screen loading overlay.
+ *
+ * Shows a blocking overlay until all stripped character fields are restored,
+ * preventing user interaction with incomplete data (empty systemPrompt,
+ * missing lorebook, etc.).
  *
  * Flow:
- * 1. Wait for __pluginApis__ to become available
- * 2. GET /db/char-details → all character detail fields at once
- * 3. For each character with __strippedFields, merge the detail and remove the marker
- * 4. Trigger Svelte reactivity via reloadKeys
+ * 1. Show full-screen overlay immediately
+ * 2. Poll for __pluginApis__ availability
+ * 3. Check if any characters have __strippedFields
+ *    - If none (COLD state / no deep-slim): dismiss overlay immediately
+ * 4. GET /db/char-details → merge all detail fields
+ * 5. Dismiss overlay
  */
 
 declare const __pluginApis__: {
@@ -24,9 +29,75 @@ interface DetailMap {
   [charId: string]: Record<string, any>;
 }
 
-/**
- * Merge detail fields into a character object and clear the stripped marker.
- */
+// --- Overlay UI ---
+
+let overlay: HTMLDivElement | null = null;
+
+function showOverlay(): void {
+  if (overlay) return;
+
+  overlay = document.createElement('div');
+  overlay.id = 'dbproxy-loading-overlay';
+  overlay.style.cssText = [
+    'position:fixed',
+    'inset:0',
+    'z-index:999999',
+    'display:flex',
+    'align-items:center',
+    'justify-content:center',
+    'background:rgba(0,0,0,0.6)',
+    'backdrop-filter:blur(4px)',
+    'transition:opacity 0.3s',
+  ].join(';');
+
+  const inner = document.createElement('div');
+  inner.style.cssText = [
+    'color:#ecf0f1',
+    'font-size:16px',
+    'text-align:center',
+    'font-family:system-ui,sans-serif',
+  ].join(';');
+
+  // Spinner
+  const spinner = document.createElement('div');
+  spinner.style.cssText = [
+    'width:40px',
+    'height:40px',
+    'margin:0 auto 16px',
+    'border:3px solid rgba(255,255,255,0.2)',
+    'border-top-color:#ecf0f1',
+    'border-radius:50%',
+    'animation:dbproxy-spin 0.8s linear infinite',
+  ].join(';');
+
+  const style = document.createElement('style');
+  style.textContent = '@keyframes dbproxy-spin{to{transform:rotate(360deg)}}';
+
+  inner.appendChild(spinner);
+  inner.appendChild(document.createTextNode('Loading character data...'));
+  overlay.appendChild(style);
+  overlay.appendChild(inner);
+
+  // Attach to body if ready, otherwise wait
+  if (document.body) {
+    document.body.appendChild(overlay);
+  } else {
+    document.addEventListener('DOMContentLoaded', () => {
+      if (overlay) document.body.appendChild(overlay);
+    });
+  }
+}
+
+function dismissOverlay(): void {
+  if (!overlay) return;
+  overlay.style.opacity = '0';
+  const el = overlay;
+  setTimeout(() => el.remove(), 300);
+  overlay = null;
+}
+
+// --- Detail merge ---
+
 function mergeDetail(char: any, detail: Record<string, any>): void {
   const stripped: string[] = char.__strippedFields;
   if (!Array.isArray(stripped)) return;
@@ -41,15 +112,12 @@ function mergeDetail(char: any, detail: Record<string, any>): void {
   char.reloadKeys = (char.reloadKeys || 0) + 1;
 }
 
-/**
- * Fetch all character details and merge into the in-memory database.
- */
 async function loadAllDetails(): Promise<void> {
   if (typeof __pluginApis__ === 'undefined') return;
   const db = __pluginApis__?.getDatabase();
   if (!db?.characters) return;
 
-  // Check if any characters need detail loading
+  // No stripped fields → proxy is in COLD state or no deep-slim applied
   const needsDetail = db.characters.some((c) => c && Array.isArray(c.__strippedFields));
   if (!needsDetail) return;
 
@@ -67,23 +135,37 @@ async function loadAllDetails(): Promise<void> {
   }
 }
 
-/**
- * Wait for __pluginApis__ then start background loading.
- */
-function waitAndLoad(): void {
+// --- Main loop ---
+
+const API_POLL_INTERVAL = 300;
+const API_POLL_MAX = 100; // ~30 seconds total
+const FAILSAFE_TIMEOUT = 35_000; // dismiss overlay no matter what
+
+function waitForApiAndLoad(): void {
   let attempts = 0;
-  const maxAttempts = 30; // ~15 seconds
+
+  // Failsafe: always dismiss overlay eventually
+  const failsafe = setTimeout(dismissOverlay, FAILSAFE_TIMEOUT);
 
   const check = () => {
     attempts++;
+
     if (typeof __pluginApis__ !== 'undefined' && __pluginApis__?.getDatabase()?.characters) {
-      loadAllDetails().catch((err) => {
-        console.error('[DB-Proxy] detail loader error:', err);
-      });
+      loadAllDetails()
+        .catch((err) => console.error('[DB-Proxy] detail loader error:', err))
+        .finally(() => {
+          clearTimeout(failsafe);
+          dismissOverlay();
+        });
       return;
     }
-    if (attempts < maxAttempts) {
-      setTimeout(check, 500);
+
+    if (attempts < API_POLL_MAX) {
+      setTimeout(check, API_POLL_INTERVAL);
+    } else {
+      // Gave up waiting for __pluginApis__
+      clearTimeout(failsafe);
+      dismissOverlay();
     }
   };
 
@@ -91,12 +173,6 @@ function waitAndLoad(): void {
 }
 
 export function installDetailLoader(): void {
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', () => {
-      // Delay to let RisuAI finish initial load
-      setTimeout(waitAndLoad, 3000);
-    });
-  } else {
-    setTimeout(waitAndLoad, 3000);
-  }
+  showOverlay();
+  waitForApiAndLoad();
 }
