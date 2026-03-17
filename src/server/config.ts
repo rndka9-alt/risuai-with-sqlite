@@ -11,6 +11,9 @@ export const UPSTREAM = {
 
 export const DB_PATH = process.env.DB_PATH || './data/proxy.db';
 
+// Logging
+export const LOG_LEVEL = process.env.LOG_LEVEL || 'info';
+
 // Circuit breaker
 export const CB_FAILURE_THRESHOLD = parseInt(
   process.env.CB_FAILURE_THRESHOLD || '5',

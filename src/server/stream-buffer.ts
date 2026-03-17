@@ -3,6 +3,7 @@ import crypto from 'crypto';
 import Database from 'better-sqlite3';
 import { UPSTREAM } from './config';
 import { createJob, appendJobResponse, updateJobStatus, getJob, getActiveJobs, deleteJob } from './db';
+import * as log from './logger';
 
 // --- Active stream tracking (in-memory, complements SQLite) ---
 
@@ -183,7 +184,7 @@ export function handleProxy2(
       });
 
       proxyRes.on('error', (err) => {
-        console.error(`[StreamBuffer] Stream error for job ${jobId}:`, err.message);
+        log.error('Stream error', { jobId, error: err.message });
         updateJobStatus(db, jobId, 'failed', err.message);
 
         if (!res.writableEnded) res.end();
@@ -200,7 +201,7 @@ export function handleProxy2(
   req.pipe(proxyReq);
 
   proxyReq.on('error', (err) => {
-    console.error(`[StreamBuffer] Upstream error for job ${jobId}:`, err.message);
+    log.error('Stream upstream error', { jobId, error: err.message });
     updateJobStatus(db, jobId, 'failed', err.message);
 
     if (!res.headersSent) {

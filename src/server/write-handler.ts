@@ -7,6 +7,7 @@ import { slimCharacter, deepSlimCharacter, mergeCharacterDetail, isColdMarker, C
 import { compressColdStorage, decompressColdStorage } from './cold-compat';
 import { upsertBlock, upsertChat, upsertCharDetail, getCharDetail, inTransaction } from './db';
 import { RisuSaveType } from '../shared/types';
+import * as log from './logger';
 
 /**
  * Handle POST /api/write for database/database.bin.
@@ -47,7 +48,7 @@ export async function handleWriteDatabase(
         }
       });
     } catch (err) {
-      console.error('[DB-Proxy] write-database background parse error:', err);
+      log.error('write-database background parse error', { error: String(err) });
     }
   });
 }
@@ -83,10 +84,13 @@ export async function handleWriteRemote(
         const detailJson = decompressColdStorage(storedDetail.data);
         const fullJson = mergeCharacterDetail(charJson, detailJson);
         body = Buffer.from(fullJson, 'utf-8');
+        log.debug('Merged stored detail into write body', { charId, strippedFields: parsed.__strippedFields.length });
+      } else {
+        log.warn('__strippedFields present but no stored detail found', { charId });
       }
     }
-  } catch {
-    // If merge fails, forward original body
+  } catch (err) {
+    log.warn('Detail merge failed, forwarding original body', { charId, error: String(err) });
   }
 
   // Forward to upstream (with full data)
@@ -187,7 +191,7 @@ export async function handleWriteRemote(
         writeToUpstream(`coldstorage/${entry.uuid}`, entry.compressed, authHeader);
       }
     } catch (err) {
-      console.error('[DB-Proxy] write-remote background parse error:', err);
+      log.error('write-remote background parse error', { error: String(err) });
     }
   });
 }

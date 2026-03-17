@@ -1,4 +1,5 @@
 import { CB_FAILURE_THRESHOLD, CB_RESET_TIMEOUT_MS } from './config';
+import * as log from './logger';
 
 export type CBState = 'CLOSED' | 'OPEN' | 'HALF_OPEN';
 
@@ -44,6 +45,9 @@ export function createCircuitBreaker(): CircuitBreaker {
     },
 
     onSuccess(): void {
+      if (state !== 'CLOSED') {
+        log.info('Circuit breaker recovered → CLOSED');
+      }
       failureCount = 0;
       state = 'CLOSED';
       halfOpenAttempted = false;
@@ -63,9 +67,7 @@ export function createCircuitBreaker(): CircuitBreaker {
       if (failureCount >= CB_FAILURE_THRESHOLD) {
         state = 'OPEN';
         openedAt = Date.now();
-        console.warn(
-          `[CircuitBreaker] OPEN after ${failureCount} failures. Bypass for ${CB_RESET_TIMEOUT_MS}ms.`,
-        );
+        log.warn('Circuit breaker OPEN', { failures: failureCount, bypassMs: CB_RESET_TIMEOUT_MS });
       }
     },
   };

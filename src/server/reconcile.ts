@@ -6,6 +6,7 @@ import { slimCharacter, deepSlimCharacter } from './slim';
 import { compressColdStorage } from './cold-compat';
 import { writeToUpstream } from './proxy';
 import { RisuSaveType } from '../shared/types';
+import * as log from './logger';
 
 /**
  * Passive reconciliation: compare a freshly fetched blob against SQLite.
@@ -47,7 +48,7 @@ export function reconcileDatabaseBin(
   });
 
   if (driftCount > 0) {
-    console.log(`[Reconcile] database.bin: ${driftCount} blocks updated`);
+    log.info('Reconcile database.bin', { blocksUpdated: driftCount });
   }
 
   return driftCount > 0;
@@ -111,9 +112,7 @@ export function reconcileRemoteFile(
     writeToUpstream(`coldstorage/${entry.uuid}`, entry.compressed, authHeader);
   }
 
-  console.log(
-    `[Reconcile] remote:${charId} updated (${coldEntries.length} cold entries)`,
-  );
+  log.info('Reconcile remote updated', { charId, coldEntries: coldEntries.length });
 
   return true;
 }

@@ -13,6 +13,7 @@ import { handleWriteDatabase, handleWriteRemote } from './write-handler';
 import { reconcileDatabaseBin, reconcileRemoteFile } from './reconcile';
 import { handleProxy2, handleGetActiveJobs, handleJobStream, handleJobAbort, handleJobConsume } from './stream-buffer';
 import { getClientJs, injectScriptTag } from './client-bundle';
+import * as log from './logger';
 import { RisuSaveType, toRisuSaveType, type HydrationState } from '../shared/types';
 
 // --- Route classification ---
@@ -125,7 +126,7 @@ function checkHydrationComplete(): void {
 
   if (capturedRemotes.size >= expectedRemoteCount) {
     hydrationState = 'HOT';
-    console.log(`[DB-Proxy] Hydration complete. State: HOT (${capturedRemotes.size} remotes cached)`);
+    log.info(`Hydration complete. State: HOT`, { remotesCached: capturedRemotes.size });
   }
 }
 
@@ -135,7 +136,7 @@ function captureDatabaseBin(body: Buffer, authHeader: string | undefined): void 
 
   const result = parseRisuSave(body);
   if (!result) {
-    console.error('[DB-Proxy] Failed to parse database.bin for hydration');
+    log.error('Failed to parse database.bin for hydration');
     return;
   }
 
@@ -150,10 +151,10 @@ function captureDatabaseBin(body: Buffer, authHeader: string | undefined): void 
   });
 
   hydrationState = 'WARMING';
-  console.log(
-    `[DB-Proxy] database.bin captured: ${result.blocks.length} blocks, ` +
-      `${expectedRemoteCount} remotes expected. State: WARMING`,
-  );
+  log.info('database.bin captured, State: WARMING', {
+    blocks: result.blocks.length,
+    remotesExpected: expectedRemoteCount,
+  });
   checkHydrationComplete();
 }
 
@@ -188,6 +189,7 @@ function captureRemoteFile(body: Buffer, charId: string, authHeader: string | un
   }
 
   capturedRemotes.add(charId);
+  log.debug('Remote captured', { charId, capturedCount: capturedRemotes.size, expectedCount: expectedRemoteCount });
   checkHydrationComplete();
 }
 
@@ -311,7 +313,7 @@ function handleRootHtml(req: http.IncomingMessage, res: http.ServerResponse): vo
 
   req.pipe(proxyReq);
   proxyReq.on('error', (err) => {
-    console.error('[DB-Proxy] root HTML proxy error:', err.message);
+    log.error('Root HTML proxy error', { error: err.message });
     if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain' });
     res.end('Bad Gateway');
   });
@@ -324,13 +326,14 @@ const cb = createCircuitBreaker();
 function main(): void {
   try {
     initDb();
-    console.log('[DB-Proxy] SQLite initialized');
+    log.info('SQLite initialized');
   } catch (err) {
-    console.error('[DB-Proxy] SQLite init failed, running in pure proxy mode:', err);
+    log.error('SQLite init failed, running in pure proxy mode', { error: String(err) });
   }
 
   const server = http.createServer((req, res) => {
     const route = classifyRequest(req);
+    log.debug('Request', { method: req.method, url: req.url, route: route.type });
 
     switch (route.type) {
       // --- DB Proxy endpoints ---
@@ -432,7 +435,7 @@ function main(): void {
             return;
           } catch (err) {
             cb.onFailure();
-            console.error('[DB-Proxy] read-database fallback:', (err instanceof Error ? err.message : String(err)));
+            log.warn('read-database fallback to upstream', { error: err instanceof Error ? err.message : String(err) });
           }
         }
         const dbAuthHeader = typeof req.headers['risu-auth'] === 'string' ? req.headers['risu-auth'] : undefined;
@@ -441,7 +444,7 @@ function main(): void {
           try {
             if (hydrationState === 'HOT') reconcileDatabaseBin(getDb(), body);
             else captureDatabaseBin(body, dbAuthHeader);
-          } catch (e) { console.error('[DB-Proxy] capture/reconcile database.bin error:', e); }
+          } catch (e) { log.error('capture/reconcile database.bin error', { error: String(e) }); }
         });
         return;
       }
@@ -455,7 +458,7 @@ function main(): void {
             return;
           } catch (err) {
             cb.onFailure();
-            console.error('[DB-Proxy] read-remote fallback:', (err instanceof Error ? err.message : String(err)));
+            log.warn('read-remote fallback to upstream', { charId: route.charId, error: err instanceof Error ? err.message : String(err) });
           }
         }
         const remoteAuthHeader = typeof req.headers['risu-auth'] === 'string' ? req.headers['risu-auth'] : undefined;
@@ -464,7 +467,7 @@ function main(): void {
           try {
             if (hydrationState === 'HOT') reconcileRemoteFile(getDb(), body, route.charId, remoteAuthHeader);
             else captureRemoteFile(body, route.charId, remoteAuthHeader);
-          } catch (e) { console.error('[DB-Proxy] capture/reconcile remote error:', e); }
+          } catch (e) { log.error('capture/reconcile remote error', { charId: route.charId, error: String(e) }); }
         });
         return;
       }
@@ -478,7 +481,7 @@ function main(): void {
             return;
           } catch (err) {
             cb.onFailure();
-            console.error('[DB-Proxy] read-coldstorage fallback:', (err instanceof Error ? err.message : String(err)));
+            log.warn('read-coldstorage fallback to upstream', { key: route.key, error: err instanceof Error ? err.message : String(err) });
           }
         }
         forwardRequest(req, res);
@@ -488,7 +491,7 @@ function main(): void {
       case 'write-database': {
         if (isDbReady()) {
           try { handleWriteDatabase(req, res, getDb()); return; }
-          catch (err) { console.error('[DB-Proxy] write-database error, bypassing:', (err instanceof Error ? err.message : String(err))); }
+          catch (err) { log.warn('write-database error, bypassing', { error: err instanceof Error ? err.message : String(err) }); }
         }
         forwardRequest(req, res);
         return;
@@ -497,7 +500,7 @@ function main(): void {
       case 'write-remote': {
         if (isDbReady()) {
           try { handleWriteRemote(req, res, route.charId, getDb()); return; }
-          catch (err) { console.error('[DB-Proxy] write-remote error, bypassing:', (err instanceof Error ? err.message : String(err))); }
+          catch (err) { log.warn('write-remote error, bypassing', { charId: route.charId, error: err instanceof Error ? err.message : String(err) }); }
         }
         forwardRequest(req, res);
         return;
@@ -511,10 +514,12 @@ function main(): void {
   });
 
   server.listen(PORT, () => {
-    console.log(`[DB-Proxy] Listening on :${PORT}`);
-    console.log(`[DB-Proxy] Upstream: ${UPSTREAM.protocol}//${UPSTREAM.host}`);
-    console.log(`[DB-Proxy] Hydration: ${hydrationState}`);
-    console.log(`[DB-Proxy] Stream buffer: enabled`);
+    log.info('Server started', {
+      port: PORT,
+      upstream: `${UPSTREAM.protocol}//${UPSTREAM.host}`,
+      hydration: hydrationState,
+      streamBuffer: 'enabled',
+    });
   });
 }
 

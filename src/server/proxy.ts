@@ -1,5 +1,6 @@
 import http from 'http';
 import { UPSTREAM } from './config';
+import * as log from './logger';
 
 /** Decode hex-encoded file-path header to UTF-8 string */
 export function decodeFilePath(req: http.IncomingMessage): string | null {
@@ -36,7 +37,7 @@ export function forwardRequest(
   req.pipe(proxyReq);
 
   proxyReq.on('error', (err) => {
-    console.error('[Proxy] upstream error:', err.message);
+    log.error('Upstream error', { error: err.message });
     if (!res.headersSent) {
       res.writeHead(502, { 'content-type': 'text/plain' });
     }
@@ -76,7 +77,7 @@ export function forwardAndTee(
         try {
           onBody(proxyRes.statusCode!, body);
         } catch (err) {
-          console.error('[Proxy] tee onBody error:', err);
+          log.error('Tee onBody error', { error: String(err) });
         }
       });
     },
@@ -85,7 +86,7 @@ export function forwardAndTee(
   req.pipe(proxyReq);
 
   proxyReq.on('error', (err) => {
-    console.error('[Proxy] upstream error:', err.message);
+    log.error('Upstream error', { error: err.message });
     if (!res.headersSent) {
       res.writeHead(502, { 'content-type': 'text/plain' });
     }
@@ -122,7 +123,7 @@ export function forwardBuffered(
   proxyReq.end(body);
 
   proxyReq.on('error', (err) => {
-    console.error('[Proxy] upstream error:', err.message);
+    log.error('Upstream error', { error: err.message });
     if (!res.headersSent) {
       res.writeHead(502, { 'content-type': 'text/plain' });
     }
@@ -160,7 +161,7 @@ export function writeToUpstream(
   proxyReq.end(data);
 
   proxyReq.on('error', (err) => {
-    console.error(`[Proxy] fire-and-forget write error (${filePath}):`, err.message);
+    log.warn('Fire-and-forget write error', { filePath, error: err.message });
   });
 }
 
