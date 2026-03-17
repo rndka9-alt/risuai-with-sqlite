@@ -1,8 +1,9 @@
 import crypto from 'crypto';
 import Database from 'better-sqlite3';
-import { getBlockHash, upsertBlock, upsertChat, deleteChatsByCharId, inTransaction } from './db';
+import { getBlockHash, upsertBlock, upsertChat, upsertCharDetail, deleteChatsByCharId, inTransaction } from './db';
 import { parseRisuSave, parseRemoteFile, parseRemotePointer } from './parser';
-import { slimCharacter } from './slim';
+import { slimCharacter, deepSlimCharacter } from './slim';
+import { compressColdStorage } from './cold-compat';
 import { writeToUpstream } from './proxy';
 import { RisuSaveType } from '../shared/types';
 
@@ -71,23 +72,33 @@ export function reconcileRemoteFile(
 
   // Hash differs — re-slim
   const charJson = block.data.toString('utf-8');
-  const { slimJson, coldEntries } = slimCharacter(charJson, charId);
-  const slimBuffer = Buffer.from(slimJson, 'utf-8');
+
+  // Phase 1: slim chats
+  const { slimJson: chatSlimJson, coldEntries } = slimCharacter(charJson, charId);
+
+  // Phase 2: deep slim (strip heavy fields)
+  const { slimJson: deepSlimJson, detailJson } = deepSlimCharacter(chatSlimJson);
+  const deepSlimBuffer = Buffer.from(deepSlimJson, 'utf-8');
+  const detailCompressed = compressColdStorage(detailJson);
+  const detailHash = crypto.createHash('sha256').update(detailJson).digest('hex');
 
   inTransaction(db, () => {
     // Remove old cold entries for this character
     deleteChatsByCharId(db, charId);
 
-    // Store new slim data
+    // Store new deep-slim data
     upsertBlock(
       db,
       `remote:${charId}`,
       RisuSaveType.CHARACTER_WITH_CHAT,
       `remote:${charId}`,
       0,
-      slimBuffer,
+      deepSlimBuffer,
       block.hash,
     );
+
+    // Store detail fields
+    upsertCharDetail(db, charId, detailCompressed, detailHash);
 
     // Store new cold entries
     for (const entry of coldEntries) {

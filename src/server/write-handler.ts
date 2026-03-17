@@ -3,9 +3,9 @@ import crypto from 'crypto';
 import Database from 'better-sqlite3';
 import { bufferBody, forwardBuffered, writeToUpstream } from './proxy';
 import { parseRisuSave, parseRemoteFile } from './parser';
-import { slimCharacter, isColdMarker, COLD_STORAGE_HEADER } from './slim';
-import { compressColdStorage } from './cold-compat';
-import { upsertBlock, upsertChat, inTransaction } from './db';
+import { slimCharacter, deepSlimCharacter, mergeCharacterDetail, isColdMarker, COLD_STORAGE_HEADER } from './slim';
+import { compressColdStorage, decompressColdStorage } from './cold-compat';
+import { upsertBlock, upsertChat, upsertCharDetail, getCharDetail, inTransaction } from './db';
 import { RisuSaveType } from '../shared/types';
 
 /**
@@ -57,11 +57,9 @@ export async function handleWriteDatabase(
  *
  * Flow:
  * 1. Buffer the body
- * 2. Forward to upstream FIRST (write-through)
- * 3. On success: parse character JSON
- *    - Chats with cold markers → skip (DB already has real data)
- *    - Chats with real messages → generate new cold entries, update slim data
- *    - Write cold entries to upstream for FS consistency
+ * 2. If __strippedFields present: merge stored detail back before forwarding
+ * 3. Forward (full) body to upstream (write-through)
+ * 4. Background: slim chats → deep slim fields → store in SQLite
  */
 export async function handleWriteRemote(
   req: http.IncomingMessage,
@@ -69,12 +67,29 @@ export async function handleWriteRemote(
   charId: string,
   db: Database.Database,
 ): Promise<void> {
-  const body = await bufferBody(req);
+  let body = await bufferBody(req);
   const authHeader = typeof req.headers['risu-auth'] === 'string'
     ? req.headers['risu-auth']
     : undefined;
 
-  // Forward to upstream first
+  // Merge stored detail if fields were stripped (client hadn't loaded detail yet)
+  try {
+    const charJson = body.toString('utf-8');
+    const parsed = JSON.parse(charJson);
+
+    if (Array.isArray(parsed.__strippedFields)) {
+      const storedDetail = getCharDetail(db, charId);
+      if (storedDetail) {
+        const detailJson = decompressColdStorage(storedDetail.data);
+        const fullJson = mergeCharacterDetail(charJson, detailJson);
+        body = Buffer.from(fullJson, 'utf-8');
+      }
+    }
+  } catch {
+    // If merge fails, forward original body
+  }
+
+  // Forward to upstream (with full data)
   forwardBuffered(req, res, body);
 
   // Background: parse and update SQLite
@@ -137,20 +152,29 @@ export async function handleWriteRemote(
         chat.localLore = [];
       }
 
-      const slimJson = JSON.stringify(character);
-      const slimBuffer = Buffer.from(slimJson, 'utf-8');
+      // Phase 1: chat-slimmed JSON
+      const chatSlimJson = JSON.stringify(character);
+
+      // Phase 2: deep slim (strip heavy fields)
+      const { slimJson: deepSlimJson, detailJson } = deepSlimCharacter(chatSlimJson);
+      const deepSlimBuffer = Buffer.from(deepSlimJson, 'utf-8');
+      const detailCompressed = compressColdStorage(detailJson);
+      const detailHash = crypto.createHash('sha256').update(detailJson).digest('hex');
 
       inTransaction(db, () => {
-        // Update slim character data
+        // Update deep-slim character data
         upsertBlock(
           db,
           `remote:${charId}`,
           RisuSaveType.CHARACTER_WITH_CHAT,
           `remote:${charId}`,
           0,
-          slimBuffer,
+          deepSlimBuffer,
           block.hash,
         );
+
+        // Store detail fields
+        upsertCharDetail(db, charId, detailCompressed, detailHash);
 
         // Store new cold entries
         for (const entry of newColdEntries) {

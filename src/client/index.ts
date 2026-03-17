@@ -5,9 +5,13 @@
 
 import { install as installFetchPatch } from './fetch-patch';
 import { recoverJobs } from './recovery';
+import { installDetailLoader } from './detail-loader';
 
 // Patch fetch to add target character header
 installFetchPatch();
+
+// Background: load stripped character detail fields
+installDetailLoader();
 
 // Wait for DOM ready, then recover any pending jobs
 if (document.readyState === 'loading') {

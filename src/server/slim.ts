@@ -3,6 +3,43 @@ import { compressColdStorage } from './cold-compat';
 
 export const COLD_STORAGE_HEADER = '\uEF01COLDSTORAGE\uEF01';
 
+/**
+ * Fields stripped from character JSON for landing-page optimization.
+ * These are heavy text/array/object fields not needed for character listing.
+ * Kept in SQLite `char_details` table and served on-demand.
+ */
+export const HEAVY_FIELDS: string[] = [
+  'firstMessage',
+  'desc',
+  'notes',
+  'personality',
+  'scenario',
+  'systemPrompt',
+  'postHistoryInstructions',
+  'exampleMessage',
+  'alternateGreetings',
+  'globalLore',
+  'customscript',
+  'triggerscript',
+  'emotionImages',
+  'additionalAssets',
+  'ccAssets',
+  'virtualscript',
+  'backgroundHTML',
+  'backgroundCSS',
+  'additionalText',
+  'replaceGlobalNote',
+  'sdData',
+  'newGenData',
+  'bias',
+  'depth_prompt',
+  'extentions',
+  'loreSettings',
+  'loreExt',
+  'defaultVariables',
+  'group_only_greetings',
+];
+
 export interface ColdEntry {
   uuid: string;
   charId: string;
@@ -14,6 +51,11 @@ export interface ColdEntry {
 export interface SlimResult {
   slimJson: string; // Character JSON with chats replaced by cold markers
   coldEntries: ColdEntry[];
+}
+
+export interface DeepSlimResult {
+  slimJson: string;   // Character JSON with heavy fields stripped
+  detailJson: string; // JSON of extracted heavy fields
 }
 
 /**
@@ -83,4 +125,63 @@ export function slimCharacter(characterJson: string, charId: string): SlimResult
   }
 
   return { slimJson: JSON.stringify(character), coldEntries };
+}
+
+/**
+ * Strip heavy fields from a character JSON (already chat-slimmed).
+ * Extracted fields are returned as a separate JSON blob for storage.
+ * A `__strippedFields` marker is added so the write path can detect
+ * and merge stored detail back before forwarding to upstream.
+ */
+export function deepSlimCharacter(characterJson: string): DeepSlimResult {
+  const character = JSON.parse(characterJson);
+  const detail: Record<string, any> = {};
+  const strippedFields: string[] = [];
+
+  for (const field of HEAVY_FIELDS) {
+    if (!(field in character) || character[field] === undefined) continue;
+
+    detail[field] = character[field];
+    strippedFields.push(field);
+
+    // Replace with type-appropriate empty value
+    const val = character[field];
+    if (typeof val === 'string') {
+      character[field] = '';
+    } else if (Array.isArray(val)) {
+      character[field] = [];
+    } else if (typeof val === 'object' && val !== null) {
+      character[field] = {};
+    }
+  }
+
+  if (strippedFields.length > 0) {
+    character.__strippedFields = strippedFields;
+  }
+
+  return {
+    slimJson: JSON.stringify(character),
+    detailJson: JSON.stringify(detail),
+  };
+}
+
+/**
+ * Merge stored detail fields back into a character JSON that has __strippedFields.
+ * Returns the full character JSON with detail restored and __strippedFields removed.
+ */
+export function mergeCharacterDetail(characterJson: string, detailJson: string): string {
+  const character = JSON.parse(characterJson);
+  const detail = JSON.parse(detailJson);
+
+  const stripped: string[] = character.__strippedFields;
+  if (!Array.isArray(stripped)) return characterJson;
+
+  for (const field of stripped) {
+    if (field in detail) {
+      character[field] = detail[field];
+    }
+  }
+
+  delete character.__strippedFields;
+  return JSON.stringify(character);
 }

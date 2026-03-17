@@ -48,6 +48,13 @@ export function initDb(): Database.Database {
       created_at  INTEGER DEFAULT (unixepoch()),
       updated_at  INTEGER DEFAULT (unixepoch())
     );
+
+    CREATE TABLE IF NOT EXISTS char_details (
+      char_id     TEXT PRIMARY KEY,
+      data        BLOB NOT NULL,
+      hash        TEXT NOT NULL,
+      updated_at  INTEGER DEFAULT (unixepoch())
+    );
   `);
 
   _db = db;
@@ -186,6 +193,49 @@ export function getChatsByCharId(
 
 export function deleteChatsByCharId(db: Database.Database, charId: string): void {
   stmt(db, 'delete_chats_by_char', 'DELETE FROM chats WHERE char_id = ?').run(charId);
+}
+
+// --- CharDetail CRUD ---
+
+export function upsertCharDetail(
+  db: Database.Database,
+  charId: string,
+  data: Buffer,
+  hash: string,
+): void {
+  stmt(
+    db,
+    'upsert_char_detail',
+    `INSERT INTO char_details (char_id, data, hash, updated_at)
+     VALUES (?, ?, ?, unixepoch())
+     ON CONFLICT(char_id) DO UPDATE SET
+       data=excluded.data, hash=excluded.hash, updated_at=unixepoch()`,
+  ).run(charId, data, hash);
+}
+
+export function getCharDetail(
+  db: Database.Database,
+  charId: string,
+): { data: Buffer; hash: string } | undefined {
+  return stmt(
+    db,
+    'get_char_detail',
+    'SELECT data, hash FROM char_details WHERE char_id = ?',
+  ).get(charId) as any;
+}
+
+export function getAllCharDetails(
+  db: Database.Database,
+): Array<{ charId: string; data: Buffer; hash: string }> {
+  return stmt(
+    db,
+    'get_all_char_details',
+    'SELECT char_id as charId, data, hash FROM char_details',
+  ).all() as any;
+}
+
+export function deleteCharDetail(db: Database.Database, charId: string): void {
+  stmt(db, 'delete_char_detail', 'DELETE FROM char_details WHERE char_id = ?').run(charId);
 }
 
 // --- Job CRUD ---

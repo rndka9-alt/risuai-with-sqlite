@@ -1,11 +1,13 @@
+import crypto from 'crypto';
 import http from 'http';
 import { PORT, UPSTREAM } from './config';
 import { forwardRequest, forwardAndTee, decodeFilePath } from './proxy';
 import { createCircuitBreaker } from './circuit-breaker';
-import { initDb, isDbReady, getDb, getBlock, getBlocksBySource, upsertBlock, upsertChat, getChat, inTransaction } from './db';
+import { initDb, isDbReady, getDb, getBlock, getBlocksBySource, upsertBlock, upsertChat, upsertCharDetail, getCharDetail, getAllCharDetails, getChat, inTransaction } from './db';
 import { parseRisuSave, parseRemoteFile, parseRemotePointer } from './parser';
 import { assembleRisuSave } from './assembler';
-import { slimCharacter } from './slim';
+import { slimCharacter, deepSlimCharacter } from './slim';
+import { compressColdStorage, decompressColdStorage } from './cold-compat';
 import { writeToUpstream } from './proxy';
 import { handleWriteDatabase, handleWriteRemote } from './write-handler';
 import { reconcileDatabaseBin, reconcileRemoteFile } from './reconcile';
@@ -21,6 +23,7 @@ const DATABASE_BIN = 'database/database.bin';
 const JOB_STREAM_RE = /^\/db\/jobs\/([^/]+)\/stream$/;
 const JOB_ABORT_RE = /^\/db\/jobs\/([^/]+)\/abort$/;
 const JOB_CONSUME_RE = /^\/db\/jobs\/([^/]+)\/consume$/;
+const CHAR_DETAIL_RE = /^\/db\/char-detail\/(.+)$/;
 
 type Route =
   | { type: 'read-database' }
@@ -34,6 +37,8 @@ type Route =
   | { type: 'db-job-stream'; jobId: string }
   | { type: 'db-job-abort'; jobId: string }
   | { type: 'db-job-consume'; jobId: string }
+  | { type: 'db-char-detail'; charId: string }
+  | { type: 'db-char-details' }
   | { type: 'root-html' }
   | { type: 'passthrough' };
 
@@ -59,6 +64,15 @@ function classifyRequest(req: http.IncomingMessage): Route {
   const consumeMatch = url.match(JOB_CONSUME_RE);
   if (consumeMatch && req.method === 'POST') {
     return { type: 'db-job-consume', jobId: consumeMatch[1] };
+  }
+
+  // Char detail endpoints
+  if (url === '/db/char-details' && req.method === 'GET') {
+    return { type: 'db-char-details' };
+  }
+  const charDetailMatch = url.match(CHAR_DETAIL_RE);
+  if (charDetailMatch && req.method === 'GET') {
+    return { type: 'db-char-detail', charId: charDetailMatch[1] };
   }
 
   // proxy2
@@ -151,11 +165,19 @@ function captureRemoteFile(body: Buffer, charId: string, authHeader: string | un
   if (!block) return;
 
   const charJson = block.data.toString('utf-8');
-  const { slimJson, coldEntries } = slimCharacter(charJson, charId);
-  const slimBuffer = Buffer.from(slimJson, 'utf-8');
+
+  // Phase 1: slim chats → cold markers
+  const { slimJson: chatSlimJson, coldEntries } = slimCharacter(charJson, charId);
+
+  // Phase 2: strip heavy fields → char_details
+  const { slimJson: deepSlimJson, detailJson } = deepSlimCharacter(chatSlimJson);
+  const deepSlimBuffer = Buffer.from(deepSlimJson, 'utf-8');
+  const detailCompressed = compressColdStorage(detailJson);
+  const detailHash = crypto.createHash('sha256').update(detailJson).digest('hex');
 
   inTransaction(db, () => {
-    upsertBlock(db, `remote:${charId}`, RisuSaveType.CHARACTER_WITH_CHAT, `remote:${charId}`, 0, slimBuffer, block.hash);
+    upsertBlock(db, `remote:${charId}`, RisuSaveType.CHARACTER_WITH_CHAT, `remote:${charId}`, 0, deepSlimBuffer, block.hash);
+    upsertCharDetail(db, charId, detailCompressed, detailHash);
     for (const entry of coldEntries) {
       upsertChat(db, entry.uuid, entry.charId, entry.chatIndex, entry.compressed, entry.hash);
     }
@@ -205,6 +227,49 @@ function handleReadColdStorage(req: http.IncomingMessage, res: http.ServerRespon
 
   res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': String(chat.data.length) });
   res.end(chat.data);
+}
+
+// --- Char detail handlers ---
+
+function handleGetCharDetail(req: http.IncomingMessage, res: http.ServerResponse, charId: string): void {
+  const db = getDb();
+  const row = getCharDetail(db, charId);
+  if (!row) {
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Not found' }));
+    return;
+  }
+
+  const json = decompressColdStorage(row.data);
+  res.writeHead(200, {
+    'content-type': 'application/json',
+    'content-length': String(Buffer.byteLength(json)),
+    'cache-control': 'no-cache',
+  });
+  res.end(json);
+}
+
+function handleGetAllCharDetails(req: http.IncomingMessage, res: http.ServerResponse): void {
+  const db = getDb();
+  const rows = getAllCharDetails(db);
+  const result: Record<string, any> = {};
+
+  for (const row of rows) {
+    try {
+      const json = decompressColdStorage(row.data);
+      result[row.charId] = JSON.parse(json);
+    } catch {
+      // Skip corrupted entries
+    }
+  }
+
+  const body = JSON.stringify(result);
+  res.writeHead(200, {
+    'content-type': 'application/json',
+    'content-length': String(Buffer.byteLength(body)),
+    'cache-control': 'no-cache',
+  });
+  res.end(body);
 }
 
 // --- HTML injection handler ---
@@ -317,6 +382,27 @@ function main(): void {
           return;
         }
         handleJobConsume(req, res, route.jobId, getDb());
+        return;
+      }
+
+      // --- Char detail endpoints ---
+      case 'db-char-detail': {
+        if (!isDbReady()) {
+          res.writeHead(404, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'DB not ready' }));
+          return;
+        }
+        handleGetCharDetail(req, res, route.charId);
+        return;
+      }
+
+      case 'db-char-details': {
+        if (!isDbReady()) {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({}));
+          return;
+        }
+        handleGetAllCharDetails(req, res);
         return;
       }
 
