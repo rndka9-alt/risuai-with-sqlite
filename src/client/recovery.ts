@@ -169,7 +169,8 @@ export async function recoverJobs(): Promise<void> {
     const resp = await fetch('/db/jobs/active');
     if (!resp.ok) return;
 
-    const { jobs } = (await resp.json()) as { jobs: Job[] };
+    const body: { jobs?: Job[] } = await resp.json();
+    const { jobs } = body;
     if (!jobs || jobs.length === 0) return;
 
     for (const job of jobs) {

@@ -57,7 +57,7 @@ function setHeader(headers: HeadersInit, key: string, value: string): void {
   } else if (Array.isArray(headers)) {
     headers.push([key, value]);
   } else {
-    (headers as Record<string, string>)[key] = value;
+    headers[key] = value;
   }
 }
 

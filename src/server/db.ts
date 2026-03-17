@@ -3,6 +3,43 @@ import fs from 'fs';
 import Database from 'better-sqlite3';
 import { DB_PATH } from './config';
 
+// --- Row type definitions ---
+
+interface BlockRow {
+  name: string;
+  type: number;
+  source: string;
+  compression: number;
+  data: Buffer;
+  hash: string;
+}
+
+interface ChatRow {
+  uuid: string;
+  charId: string;
+  chatIndex: number;
+  data: Buffer;
+  hash: string;
+}
+
+interface CharDetailRow {
+  charId: string;
+  data: Buffer;
+  hash: string;
+}
+
+interface JobRow {
+  id: string;
+  char_id: string | null;
+  status: string;
+  response: string;
+  error: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+// ---
+
 let _db: Database.Database | null = null;
 
 export function initDb(): Database.Database {
@@ -70,18 +107,15 @@ export function isDbReady(): boolean {
   return _db !== null;
 }
 
-// --- Block CRUD ---
+// --- Typed prepare helper ---
+// better-sqlite3's prepare() accepts a Result generic.
+// We use this instead of a statement cache to avoid `as` type assertions.
 
-const _stmtCache = new Map<string, Database.Statement>();
-
-function stmt(db: Database.Database, key: string, sql: string): Database.Statement {
-  let s = _stmtCache.get(key);
-  if (!s) {
-    s = db.prepare(sql);
-    _stmtCache.set(key, s);
-  }
-  return s;
+function prep<T>(db: Database.Database, sql: string) {
+  return db.prepare<unknown[], T>(sql);
 }
+
+// --- Block CRUD ---
 
 export function upsertBlock(
   db: Database.Database,
@@ -92,9 +126,7 @@ export function upsertBlock(
   data: Buffer,
   hash: string,
 ): void {
-  stmt(
-    db,
-    'upsert_block',
+  prep(db,
     `INSERT INTO blocks (name, type, source, compression, data, hash, updated_at)
      VALUES (?, ?, ?, ?, ?, ?, unixepoch())
      ON CONFLICT(name) DO UPDATE SET
@@ -104,47 +136,44 @@ export function upsertBlock(
   ).run(name, type, source, compression, data, hash);
 }
 
+type BlockResult = Pick<BlockRow, 'type' | 'source' | 'compression' | 'data' | 'hash'>;
+type BlocksBySourceResult = Pick<BlockRow, 'name' | 'type' | 'compression' | 'data' | 'hash'>;
+
 export function getBlock(
   db: Database.Database,
   name: string,
-): { type: number; source: string; compression: number; data: Buffer; hash: string } | undefined {
-  return stmt(
-    db,
-    'get_block',
+): BlockResult | undefined {
+  return prep<BlockResult>(db,
     'SELECT type, source, compression, data, hash FROM blocks WHERE name = ?',
-  ).get(name) as any;
+  ).get(name);
 }
 
 export function getBlocksBySource(
   db: Database.Database,
   source: string,
-): Array<{ name: string; type: number; compression: number; data: Buffer; hash: string }> {
-  return stmt(
-    db,
-    'get_blocks_by_source',
+): BlocksBySourceResult[] {
+  return prep<BlocksBySourceResult>(db,
     'SELECT name, type, compression, data, hash FROM blocks WHERE source = ?',
-  ).all(source) as any;
+  ).all(source);
 }
 
 export function getBlockHash(
   db: Database.Database,
   name: string,
 ): string | undefined {
-  const row = stmt(
-    db,
-    'get_block_hash',
+  const row = prep<Pick<BlockRow, 'hash'>>(db,
     'SELECT hash FROM blocks WHERE name = ?',
-  ).get(name) as { hash: string } | undefined;
+  ).get(name);
   return row?.hash;
 }
 
 export function deleteBlock(db: Database.Database, name: string): void {
-  stmt(db, 'delete_block', 'DELETE FROM blocks WHERE name = ?').run(name);
+  prep(db, 'DELETE FROM blocks WHERE name = ?').run(name);
 }
 
 export function blockCount(db: Database.Database): number {
-  const row = stmt(db, 'block_count', 'SELECT COUNT(*) as cnt FROM blocks').get() as { cnt: number };
-  return row.cnt;
+  const row = prep<{ cnt: number }>(db, 'SELECT COUNT(*) as cnt FROM blocks').get();
+  return row?.cnt ?? 0;
 }
 
 // --- Chat CRUD ---
@@ -157,9 +186,7 @@ export function upsertChat(
   data: Buffer,
   hash: string,
 ): void {
-  stmt(
-    db,
-    'upsert_chat',
+  prep(db,
     `INSERT INTO chats (uuid, char_id, chat_index, data, hash, updated_at)
      VALUES (?, ?, ?, ?, ?, unixepoch())
      ON CONFLICT(uuid) DO UPDATE SET
@@ -168,31 +195,29 @@ export function upsertChat(
   ).run(uuid, charId, chatIndex, data, hash);
 }
 
+type ChatResult = Pick<ChatRow, 'charId' | 'chatIndex' | 'data' | 'hash'>;
+type ChatsByCharResult = Pick<ChatRow, 'uuid' | 'chatIndex' | 'data' | 'hash'>;
+
 export function getChat(
   db: Database.Database,
   uuid: string,
-): { charId: string; chatIndex: number; data: Buffer; hash: string } | undefined {
-  const row = stmt(
-    db,
-    'get_chat',
+): ChatResult | undefined {
+  return prep<ChatResult>(db,
     'SELECT char_id as charId, chat_index as chatIndex, data, hash FROM chats WHERE uuid = ?',
-  ).get(uuid) as any;
-  return row;
+  ).get(uuid);
 }
 
 export function getChatsByCharId(
   db: Database.Database,
   charId: string,
-): Array<{ uuid: string; chatIndex: number; data: Buffer; hash: string }> {
-  return stmt(
-    db,
-    'get_chats_by_char',
+): ChatsByCharResult[] {
+  return prep<ChatsByCharResult>(db,
     'SELECT uuid, chat_index as chatIndex, data, hash FROM chats WHERE char_id = ? ORDER BY chat_index',
-  ).all(charId) as any;
+  ).all(charId);
 }
 
 export function deleteChatsByCharId(db: Database.Database, charId: string): void {
-  stmt(db, 'delete_chats_by_char', 'DELETE FROM chats WHERE char_id = ?').run(charId);
+  prep(db, 'DELETE FROM chats WHERE char_id = ?').run(charId);
 }
 
 // --- CharDetail CRUD ---
@@ -203,9 +228,7 @@ export function upsertCharDetail(
   data: Buffer,
   hash: string,
 ): void {
-  stmt(
-    db,
-    'upsert_char_detail',
+  prep(db,
     `INSERT INTO char_details (char_id, data, hash, updated_at)
      VALUES (?, ?, ?, unixepoch())
      ON CONFLICT(char_id) DO UPDATE SET
@@ -213,29 +236,27 @@ export function upsertCharDetail(
   ).run(charId, data, hash);
 }
 
+type CharDetailResult = Pick<CharDetailRow, 'data' | 'hash'>;
+
 export function getCharDetail(
   db: Database.Database,
   charId: string,
-): { data: Buffer; hash: string } | undefined {
-  return stmt(
-    db,
-    'get_char_detail',
+): CharDetailResult | undefined {
+  return prep<CharDetailResult>(db,
     'SELECT data, hash FROM char_details WHERE char_id = ?',
-  ).get(charId) as any;
+  ).get(charId);
 }
 
 export function getAllCharDetails(
   db: Database.Database,
-): Array<{ charId: string; data: Buffer; hash: string }> {
-  return stmt(
-    db,
-    'get_all_char_details',
+): CharDetailRow[] {
+  return prep<CharDetailRow>(db,
     'SELECT char_id as charId, data, hash FROM char_details',
-  ).all() as any;
+  ).all();
 }
 
 export function deleteCharDetail(db: Database.Database, charId: string): void {
-  stmt(db, 'delete_char_detail', 'DELETE FROM char_details WHERE char_id = ?').run(charId);
+  prep(db, 'DELETE FROM char_details WHERE char_id = ?').run(charId);
 }
 
 // --- Job CRUD ---
@@ -245,9 +266,7 @@ export function createJob(
   id: string,
   charId: string | null,
 ): void {
-  stmt(
-    db,
-    'create_job',
+  prep(db,
     `INSERT INTO jobs (id, char_id, status, response, created_at, updated_at)
      VALUES (?, ?, 'streaming', '', unixepoch(), unixepoch())`,
   ).run(id, charId);
@@ -258,9 +277,7 @@ export function appendJobResponse(
   id: string,
   text: string,
 ): void {
-  stmt(
-    db,
-    'append_job_response',
+  prep(db,
     `UPDATE jobs SET response = ?, updated_at = unixepoch() WHERE id = ?`,
   ).run(text, id);
 }
@@ -271,9 +288,7 @@ export function updateJobStatus(
   status: string,
   error?: string,
 ): void {
-  stmt(
-    db,
-    'update_job_status',
+  prep(db,
     `UPDATE jobs SET status = ?, error = ?, updated_at = unixepoch() WHERE id = ?`,
   ).run(status, error ?? null, id);
 }
@@ -281,28 +296,24 @@ export function updateJobStatus(
 export function getJob(
   db: Database.Database,
   id: string,
-): { id: string; char_id: string | null; status: string; response: string; error: string | null; created_at: number; updated_at: number } | undefined {
-  return stmt(
-    db,
-    'get_job',
+): JobRow | undefined {
+  return prep<JobRow>(db,
     'SELECT id, char_id, status, response, error, created_at, updated_at FROM jobs WHERE id = ?',
-  ).get(id) as ReturnType<typeof getJob>;
+  ).get(id);
 }
 
 export function getActiveJobs(
   db: Database.Database,
-): Array<{ id: string; char_id: string | null; status: string; response: string; error: string | null; created_at: number; updated_at: number }> {
-  return stmt(
-    db,
-    'get_active_jobs',
+): JobRow[] {
+  return prep<JobRow>(db,
     `SELECT id, char_id, status, response, error, created_at, updated_at
      FROM jobs WHERE status IN ('streaming', 'completed', 'failed')
      ORDER BY created_at DESC`,
-  ).all() as ReturnType<typeof getActiveJobs>;
+  ).all();
 }
 
 export function deleteJob(db: Database.Database, id: string): void {
-  stmt(db, 'delete_job', 'DELETE FROM jobs WHERE id = ?').run(id);
+  prep(db, 'DELETE FROM jobs WHERE id = ?').run(id);
 }
 
 // --- Transaction helper ---

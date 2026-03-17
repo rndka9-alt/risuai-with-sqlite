@@ -1,10 +1,12 @@
 import crypto from 'crypto';
 import zlib from 'zlib';
-import { RisuSaveType, type ParsedBlock } from '../shared/types';
+import { RisuSaveType, toRisuSaveType, type ParsedBlock } from '../shared/types';
 
 const MAGIC_HEADER = Buffer.from('RISUSAVE\0', 'utf-8');
 
-const KNOWN_TYPES = new Set([0, 1, 2, 3, 4, 5, 6, 7, 8]);
+function toCompression(val: number): 0 | 1 | null {
+  return val === 0 || val === 1 ? val : null;
+}
 
 /**
  * Parse a RisuSave binary (database.bin) into blocks.
@@ -25,11 +27,11 @@ export function parseRisuSave(
 
   while (offset + 7 <= buffer.length) {
     try {
-      const rawType = buffer[offset];
-      const compression = buffer[offset + 1];
+      const blockType = toRisuSaveType(buffer[offset]);
+      const compression = toCompression(buffer[offset + 1]);
       offset += 2;
 
-      if (!KNOWN_TYPES.has(rawType)) break;
+      if (blockType === null || compression === null) break;
 
       const nameLen = buffer[offset];
       offset += 1;
@@ -63,14 +65,14 @@ export function parseRisuSave(
 
       blocks.push({
         name,
-        type: rawType as RisuSaveType,
-        compression: compression as 0 | 1,
+        type: blockType,
+        compression,
         data,
         hash,
       });
 
       // Extract __directory from ROOT block
-      if (rawType === RisuSaveType.ROOT) {
+      if (blockType === RisuSaveType.ROOT) {
         try {
           const rootData = JSON.parse(data.toString('utf-8'));
           if (Array.isArray(rootData.__directory)) {

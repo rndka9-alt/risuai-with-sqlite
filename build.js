@@ -1,6 +1,4 @@
-'use strict';
-
-const esbuild = require('esbuild');
+import esbuild from 'esbuild';
 
 // Client bundle (browser IIFE)
 esbuild.buildSync({
@@ -11,12 +9,12 @@ esbuild.buildSync({
   target: 'es2018',
 });
 
-// Server bundle (Node.js CJS)
+// Server bundle (Node.js ESM)
 esbuild.buildSync({
   entryPoints: ['src/server/index.ts'],
   bundle: true,
   platform: 'node',
-  format: 'cjs',
+  format: 'esm',
   outfile: 'dist/server.js',
   target: 'node18',
   external: ['better-sqlite3'],

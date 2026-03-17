@@ -1,5 +1,5 @@
 /** RisuSave block types (mirrors RisuAI's RisuSaveType enum) */
-export const enum RisuSaveType {
+export enum RisuSaveType {
   CONFIG = 0,
   ROOT = 1,
   CHARACTER_WITH_CHAT = 2,
@@ -9,6 +9,15 @@ export const enum RisuSaveType {
   REMOTE = 6,
   CHARACTER_WITHOUT_CHAT = 7,
   ROOT_COMPONENT = 8,
+}
+
+const RISU_SAVE_TYPE_VALUES = new Set<number>(
+  Object.values(RisuSaveType).filter((v): v is number => typeof v === 'number'),
+);
+
+/** Type guard: narrow a number to RisuSaveType */
+export function toRisuSaveType(val: number): RisuSaveType | null {
+  return RISU_SAVE_TYPE_VALUES.has(val) ? val : null;
 }
 
 export interface ParsedBlock {

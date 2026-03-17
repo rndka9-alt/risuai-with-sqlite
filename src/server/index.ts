@@ -13,7 +13,7 @@ import { handleWriteDatabase, handleWriteRemote } from './write-handler';
 import { reconcileDatabaseBin, reconcileRemoteFile } from './reconcile';
 import { handleProxy2, handleGetActiveJobs, handleJobStream, handleJobAbort, handleJobConsume } from './stream-buffer';
 import { getClientJs, injectScriptTag } from './client-bundle';
-import { RisuSaveType, type HydrationState } from '../shared/types';
+import { RisuSaveType, toRisuSaveType, type HydrationState } from '../shared/types';
 
 // --- Route classification ---
 
@@ -201,7 +201,7 @@ function handleReadDatabase(req: http.IncomingMessage, res: http.ServerResponse)
   const binary = assembleRisuSave(
     rows.map((r) => ({
       name: r.name,
-      type: r.type as RisuSaveType,
+      type: toRisuSaveType(r.type) ?? RisuSaveType.CONFIG,
       data: r.data,
       compress: r.compression === 1,
     })),
@@ -432,7 +432,7 @@ function main(): void {
             return;
           } catch (err) {
             cb.onFailure();
-            console.error('[DB-Proxy] read-database fallback:', (err as Error).message);
+            console.error('[DB-Proxy] read-database fallback:', (err instanceof Error ? err.message : String(err)));
           }
         }
         const dbAuthHeader = typeof req.headers['risu-auth'] === 'string' ? req.headers['risu-auth'] : undefined;
@@ -455,7 +455,7 @@ function main(): void {
             return;
           } catch (err) {
             cb.onFailure();
-            console.error('[DB-Proxy] read-remote fallback:', (err as Error).message);
+            console.error('[DB-Proxy] read-remote fallback:', (err instanceof Error ? err.message : String(err)));
           }
         }
         const remoteAuthHeader = typeof req.headers['risu-auth'] === 'string' ? req.headers['risu-auth'] : undefined;
@@ -478,7 +478,7 @@ function main(): void {
             return;
           } catch (err) {
             cb.onFailure();
-            console.error('[DB-Proxy] read-coldstorage fallback:', (err as Error).message);
+            console.error('[DB-Proxy] read-coldstorage fallback:', (err instanceof Error ? err.message : String(err)));
           }
         }
         forwardRequest(req, res);
@@ -488,7 +488,7 @@ function main(): void {
       case 'write-database': {
         if (isDbReady()) {
           try { handleWriteDatabase(req, res, getDb()); return; }
-          catch (err) { console.error('[DB-Proxy] write-database error, bypassing:', (err as Error).message); }
+          catch (err) { console.error('[DB-Proxy] write-database error, bypassing:', (err instanceof Error ? err.message : String(err))); }
         }
         forwardRequest(req, res);
         return;
@@ -497,7 +497,7 @@ function main(): void {
       case 'write-remote': {
         if (isDbReady()) {
           try { handleWriteRemote(req, res, route.charId, getDb()); return; }
-          catch (err) { console.error('[DB-Proxy] write-remote error, bypassing:', (err as Error).message); }
+          catch (err) { console.error('[DB-Proxy] write-remote error, bypassing:', (err instanceof Error ? err.message : String(err))); }
         }
         forwardRequest(req, res);
         return;
