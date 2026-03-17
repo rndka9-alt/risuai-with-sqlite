@@ -38,7 +38,7 @@ describe('extractColdKey', () => {
 });
 
 describe('slimCharacter', () => {
-  it('replaces chat messages with cold markers', () => {
+  it('replaces chat messages with cold markers', async () => {
     const char = {
       name: 'Alice',
       chaId: 'char-1',
@@ -47,7 +47,7 @@ describe('slimCharacter', () => {
       ],
     };
 
-    const { slimJson, coldEntries } = slimCharacter(JSON.stringify(char), 'char-1');
+    const { slimJson, coldEntries } = await slimCharacter(JSON.stringify(char), 'char-1');
     const slim = JSON.parse(slimJson);
 
     expect(coldEntries).toHaveLength(1);
@@ -55,7 +55,7 @@ describe('slimCharacter', () => {
     expect(slim.name).toBe('Alice');
   });
 
-  it('skips chats that are already cold-markered', () => {
+  it('skips chats that are already cold-markered', async () => {
     const char = {
       chaId: 'char-1',
       chats: [
@@ -63,20 +63,20 @@ describe('slimCharacter', () => {
       ],
     };
 
-    const { coldEntries } = slimCharacter(JSON.stringify(char), 'char-1');
+    const { coldEntries } = await slimCharacter(JSON.stringify(char), 'char-1');
     expect(coldEntries).toHaveLength(0);
   });
 
-  it('skips empty chats', () => {
+  it('skips empty chats', async () => {
     const char = { chaId: 'char-1', chats: [{ message: [] }] };
-    const { coldEntries } = slimCharacter(JSON.stringify(char), 'char-1');
+    const { coldEntries } = await slimCharacter(JSON.stringify(char), 'char-1');
     expect(coldEntries).toHaveLength(0);
   });
 
-  it('returns original JSON if no chats array', () => {
+  it('returns original JSON if no chats array', async () => {
     const char = { chaId: 'char-1', name: 'Bob' };
     const json = JSON.stringify(char);
-    const { slimJson, coldEntries } = slimCharacter(json, 'char-1');
+    const { slimJson, coldEntries } = await slimCharacter(json, 'char-1');
     expect(slimJson).toBe(json);
     expect(coldEntries).toHaveLength(0);
   });

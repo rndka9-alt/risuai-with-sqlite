@@ -77,13 +77,19 @@ export function extractColdKey(markerData: string): string | null {
  * Process a character: replace all chat messages with cold storage markers.
  * Returns the slim JSON and the extracted cold entries.
  */
-export function slimCharacter(characterJson: string, charId: string): SlimResult {
+export async function slimCharacter(characterJson: string, charId: string): Promise<SlimResult> {
   const character = JSON.parse(characterJson);
-  const coldEntries: ColdEntry[] = [];
 
   if (!Array.isArray(character.chats)) {
-    return { slimJson: characterJson, coldEntries };
+    return { slimJson: characterJson, coldEntries: [] };
   }
+
+  // Collect compression tasks first, then run in parallel on libuv thread pool
+  const tasks: Array<{
+    chatIndex: number;
+    uuid: string;
+    coldPayload: string;
+  }> = [];
 
   for (let i = 0; i < character.chats.length; i++) {
     const chat = character.chats[i];
@@ -105,10 +111,7 @@ export function slimCharacter(characterJson: string, charId: string): SlimResult
       localLore: chat.localLore,
     });
 
-    const compressed = compressColdStorage(coldPayload);
-    const hash = crypto.createHash('sha256').update(coldPayload).digest('hex');
-
-    coldEntries.push({ uuid, charId, chatIndex: i, compressed, hash });
+    tasks.push({ chatIndex: i, uuid, coldPayload });
 
     // Replace chat with cold marker (matches RisuAI's makeColdData behavior)
     chat.message = [
@@ -123,6 +126,15 @@ export function slimCharacter(characterJson: string, charId: string): SlimResult
     chat.scriptstate = {};
     chat.localLore = [];
   }
+
+  // Compress all chats in parallel (runs on libuv worker threads)
+  const coldEntries = await Promise.all(
+    tasks.map(async (task) => {
+      const compressed = await compressColdStorage(task.coldPayload);
+      const hash = crypto.createHash('sha256').update(task.coldPayload).digest('hex');
+      return { uuid: task.uuid, charId, chatIndex: task.chatIndex, compressed, hash };
+    }),
+  );
 
   return { slimJson: JSON.stringify(character), coldEntries };
 }

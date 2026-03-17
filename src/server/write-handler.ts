@@ -81,7 +81,7 @@ export async function handleWriteRemote(
     if (Array.isArray(parsed.__strippedFields)) {
       const storedDetail = getCharDetail(db, charId);
       if (storedDetail) {
-        const detailJson = decompressColdStorage(storedDetail.data);
+        const detailJson = await decompressColdStorage(storedDetail.data);
         const fullJson = mergeCharacterDetail(charJson, detailJson);
         body = Buffer.from(fullJson, 'utf-8');
         log.debug('Merged stored detail into write body', { charId, strippedFields: parsed.__strippedFields.length });
@@ -97,13 +97,13 @@ export async function handleWriteRemote(
   forwardBuffered(req, res, body);
 
   // Background: parse and update SQLite
-  setImmediate(() => {
+  setImmediate(async () => {
     try {
       const block = parseRemoteFile(body, charId);
       if (!block) return;
 
       const charJson = block.data.toString('utf-8');
-      let character: any;
+      let character: Record<string, unknown>;
       try {
         character = JSON.parse(charJson);
       } catch {
@@ -112,26 +112,20 @@ export async function handleWriteRemote(
 
       if (!Array.isArray(character.chats)) return;
 
-      const newColdEntries: Array<{
-        uuid: string;
-        charId: string;
+      const chats = character.chats;
+      const tasks: Array<{
         chatIndex: number;
-        compressed: Buffer;
-        hash: string;
+        uuid: string;
+        coldPayload: string;
       }> = [];
 
-      // Process each chat
-      for (let i = 0; i < character.chats.length; i++) {
-        const chat = character.chats[i];
+      // Collect chats that need cold storage
+      for (let i = 0; i < chats.length; i++) {
+        const chat = chats[i];
 
-        if (isColdMarker(chat)) {
-          // Cold marker → DB already has real data, skip
-          continue;
-        }
-
+        if (isColdMarker(chat)) continue;
         if (!Array.isArray(chat.message) || chat.message.length === 0) continue;
 
-        // Real messages → create cold entry
         const uuid = crypto.randomUUID();
         const coldPayload = JSON.stringify({
           message: chat.message,
@@ -141,10 +135,7 @@ export async function handleWriteRemote(
           localLore: chat.localLore,
         });
 
-        const compressed = compressColdStorage(coldPayload);
-        const hash = crypto.createHash('sha256').update(coldPayload).digest('hex');
-
-        newColdEntries.push({ uuid, charId, chatIndex: i, compressed, hash });
+        tasks.push({ chatIndex: i, uuid, coldPayload });
 
         // Replace chat with marker for slim version
         chat.message = [
@@ -156,13 +147,22 @@ export async function handleWriteRemote(
         chat.localLore = [];
       }
 
+      // Compress all chats in parallel (runs on libuv worker threads)
+      const newColdEntries = await Promise.all(
+        tasks.map(async (task) => {
+          const compressed = await compressColdStorage(task.coldPayload);
+          const hash = crypto.createHash('sha256').update(task.coldPayload).digest('hex');
+          return { uuid: task.uuid, charId, chatIndex: task.chatIndex, compressed, hash };
+        }),
+      );
+
       // Phase 1: chat-slimmed JSON
       const chatSlimJson = JSON.stringify(character);
 
       // Phase 2: deep slim (strip heavy fields)
       const { slimJson: deepSlimJson, detailJson } = deepSlimCharacter(chatSlimJson);
       const deepSlimBuffer = Buffer.from(deepSlimJson, 'utf-8');
-      const detailCompressed = compressColdStorage(detailJson);
+      const detailCompressed = await compressColdStorage(detailJson);
       const detailHash = crypto.createHash('sha256').update(detailJson).digest('hex');
 
       inTransaction(db, () => {

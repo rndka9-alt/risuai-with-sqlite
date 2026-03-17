@@ -20,6 +20,9 @@ export function forwardRequest(
   req: http.IncomingMessage,
   res: http.ServerResponse,
 ): void {
+  const t0 = performance.now();
+  const rid = req.headers['x-request-id'] || '';
+
   const proxyReq = http.request(
     {
       hostname: UPSTREAM.hostname,
@@ -29,6 +32,7 @@ export function forwardRequest(
       headers: { ...req.headers, host: UPSTREAM.host },
     },
     (proxyRes) => {
+      log.debug('upstream TTFB', { rid, url: req.url, ms: (performance.now() - t0).toFixed(0) });
       res.writeHead(proxyRes.statusCode!, proxyRes.headers);
       proxyRes.pipe(res);
     },
@@ -37,7 +41,7 @@ export function forwardRequest(
   req.pipe(proxyReq);
 
   proxyReq.on('error', (err) => {
-    log.error('Upstream error', { error: err.message });
+    log.error('Upstream error', { rid, error: err.message });
     if (!res.headersSent) {
       res.writeHead(502, { 'content-type': 'text/plain' });
     }
@@ -55,6 +59,9 @@ export function forwardAndTee(
   res: http.ServerResponse,
   onBody: (statusCode: number, body: Buffer) => void,
 ): void {
+  const t0 = performance.now();
+  const rid = req.headers['x-request-id'] || '';
+
   const proxyReq = http.request(
     {
       hostname: UPSTREAM.hostname,
@@ -64,6 +71,8 @@ export function forwardAndTee(
       headers: { ...req.headers, host: UPSTREAM.host },
     },
     (proxyRes) => {
+      const ttfb = performance.now();
+      log.debug('upstream TTFB', { rid, url: req.url, ms: (ttfb - t0).toFixed(0) });
       res.writeHead(proxyRes.statusCode!, proxyRes.headers);
 
       const chunks: Buffer[] = [];
@@ -72,12 +81,13 @@ export function forwardAndTee(
         chunks.push(chunk);
       });
       proxyRes.on('end', () => {
+        log.debug('upstream done', { rid, url: req.url, totalMs: (performance.now() - t0).toFixed(0), bodyKB: String((Buffer.concat(chunks).length / 1024).toFixed(0)) });
         res.end();
         const body = Buffer.concat(chunks);
         try {
           onBody(proxyRes.statusCode!, body);
         } catch (err) {
-          log.error('Tee onBody error', { error: String(err) });
+          log.error('Tee onBody error', { rid, error: String(err) });
         }
       });
     },
@@ -86,7 +96,7 @@ export function forwardAndTee(
   req.pipe(proxyReq);
 
   proxyReq.on('error', (err) => {
-    log.error('Upstream error', { error: err.message });
+    log.error('Upstream error', { rid, error: err.message });
     if (!res.headersSent) {
       res.writeHead(502, { 'content-type': 'text/plain' });
     }
@@ -178,8 +188,11 @@ export function writeToUpstream(
 export function forwardBufferAndTransform(
   req: http.IncomingMessage,
   res: http.ServerResponse,
-  transform: (statusCode: number, headers: http.IncomingHttpHeaders, body: Buffer) => Buffer | null,
+  transform: (statusCode: number, headers: http.IncomingHttpHeaders, body: Buffer) => Promise<Buffer | null> | Buffer | null,
 ): void {
+  const t0 = performance.now();
+  const rid = req.headers['x-request-id'] || '';
+
   const proxyReq = http.request(
     {
       hostname: UPSTREAM.hostname,
@@ -189,24 +202,43 @@ export function forwardBufferAndTransform(
       headers: { ...req.headers, host: UPSTREAM.host },
     },
     (proxyRes) => {
+      const ttfb = performance.now();
+      log.debug('upstream TTFB', { rid, url: req.url, ms: (ttfb - t0).toFixed(0) });
+
       const chunks: Buffer[] = [];
       proxyRes.on('data', (chunk: Buffer) => chunks.push(chunk));
       proxyRes.on('end', () => {
         const body = Buffer.concat(chunks);
+        const upstreamMs = performance.now() - t0;
+        log.debug('upstream done', { rid, url: req.url, upstreamMs: upstreamMs.toFixed(0), bodyKB: String((body.length / 1024).toFixed(0)) });
 
-        let transformed: Buffer | null = null;
+        const sendResponse = (transformed: Buffer | null): void => {
+          const totalMs = performance.now() - t0;
+          log.info('bufferAndTransform complete', { rid, url: req.url, upstreamMs: upstreamMs.toFixed(0), transformMs: (totalMs - upstreamMs).toFixed(0), totalMs: totalMs.toFixed(0) });
+          const output = transformed ?? body;
+          const headers = { ...proxyRes.headers };
+          headers['content-length'] = String(output.length);
+          delete headers['content-encoding'];
+          res.writeHead(proxyRes.statusCode!, headers);
+          res.end(output);
+        };
+
         try {
-          transformed = transform(proxyRes.statusCode!, proxyRes.headers, body);
+          const result = transform(proxyRes.statusCode!, proxyRes.headers, body);
+          if (result instanceof Promise) {
+            result
+              .then(sendResponse)
+              .catch((err) => {
+                log.error('Async transform error, sending original', { rid, error: String(err) });
+                sendResponse(null);
+              });
+          } else {
+            sendResponse(result);
+          }
         } catch (err) {
-          log.error('Transform error, sending original', { error: String(err) });
+          log.error('Transform error, sending original', { rid, error: String(err) });
+          sendResponse(null);
         }
-
-        const output = transformed ?? body;
-        const headers = { ...proxyRes.headers };
-        headers['content-length'] = String(output.length);
-        delete headers['content-encoding'];
-        res.writeHead(proxyRes.statusCode!, headers);
-        res.end(output);
       });
     },
   );
@@ -214,7 +246,7 @@ export function forwardBufferAndTransform(
   req.pipe(proxyReq);
 
   proxyReq.on('error', (err) => {
-    log.error('Upstream error', { error: err.message });
+    log.error('Upstream error', { rid, error: err.message });
     if (!res.headersSent) {
       res.writeHead(502, { 'content-type': 'text/plain' });
     }

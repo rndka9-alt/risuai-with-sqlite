@@ -59,12 +59,12 @@ export function reconcileDatabaseBin(
  * If the hash differs, re-slim the character and update cold entries.
  * Returns true if drift was detected.
  */
-export function reconcileRemoteFile(
+export async function reconcileRemoteFile(
   db: Database.Database,
   body: Buffer,
   charId: string,
   authHeader: string | undefined,
-): boolean {
+): Promise<boolean> {
   const block = parseRemoteFile(body, charId);
   if (!block) return false;
 
@@ -74,13 +74,13 @@ export function reconcileRemoteFile(
   // Hash differs — re-slim
   const charJson = block.data.toString('utf-8');
 
-  // Phase 1: slim chats
-  const { slimJson: chatSlimJson, coldEntries } = slimCharacter(charJson, charId);
+  // Phase 1: slim chats (parallel gzip on libuv threads)
+  const { slimJson: chatSlimJson, coldEntries } = await slimCharacter(charJson, charId);
 
   // Phase 2: deep slim (strip heavy fields)
   const { slimJson: deepSlimJson, detailJson } = deepSlimCharacter(chatSlimJson);
   const deepSlimBuffer = Buffer.from(deepSlimJson, 'utf-8');
-  const detailCompressed = compressColdStorage(detailJson);
+  const detailCompressed = await compressColdStorage(detailJson);
   const detailHash = crypto.createHash('sha256').update(detailJson).digest('hex');
 
   inTransaction(db, () => {

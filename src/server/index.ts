@@ -164,23 +164,27 @@ function captureDatabaseBin(body: Buffer, authHeader: string | undefined): void 
   checkHydrationComplete();
 }
 
-function captureRemoteFile(body: Buffer, charId: string, authHeader: string | undefined): void {
+async function captureRemoteFile(body: Buffer, charId: string, authHeader: string | undefined): Promise<void> {
   if (!isDbReady()) return;
   const db = getDb();
+  const t0 = performance.now();
 
   const block = parseRemoteFile(body, charId);
   if (!block) return;
 
   const charJson = block.data.toString('utf-8');
+  const t1 = performance.now();
 
-  // Phase 1: slim chats → cold markers
-  const { slimJson: chatSlimJson, coldEntries } = slimCharacter(charJson, charId);
+  // Phase 1: slim chats → cold markers (parallel gzip on libuv threads)
+  const { slimJson: chatSlimJson, coldEntries } = await slimCharacter(charJson, charId);
+  const t2 = performance.now();
 
   // Phase 2: strip heavy fields → char_details
   const { slimJson: deepSlimJson, detailJson } = deepSlimCharacter(chatSlimJson);
   const deepSlimBuffer = Buffer.from(deepSlimJson, 'utf-8');
-  const detailCompressed = compressColdStorage(detailJson);
+  const detailCompressed = await compressColdStorage(detailJson);
   const detailHash = crypto.createHash('sha256').update(detailJson).digest('hex');
+  const t3 = performance.now();
 
   inTransaction(db, () => {
     upsertBlock(db, `remote:${charId}`, RisuSaveType.CHARACTER_WITH_CHAT, `remote:${charId}`, 0, deepSlimBuffer, block.hash);
@@ -189,13 +193,24 @@ function captureRemoteFile(body: Buffer, charId: string, authHeader: string | un
       upsertChat(db, entry.uuid, entry.charId, entry.chatIndex, entry.compressed, entry.hash);
     }
   });
+  const t4 = performance.now();
 
   for (const entry of coldEntries) {
     writeToUpstream(`coldstorage/${entry.uuid}`, entry.compressed, authHeader);
   }
 
   capturedRemotes.add(charId);
-  log.debug('Remote captured', { charId, capturedCount: capturedRemotes.size, expectedCount: expectedRemoteCount });
+  log.info('captureRemoteFile timing', {
+    charId,
+    bodyKB: String((body.length / 1024).toFixed(0)),
+    coldEntries: String(coldEntries.length),
+    parse: (t1 - t0).toFixed(0) + 'ms',
+    slim: (t2 - t1).toFixed(0) + 'ms',
+    deepSlim: (t3 - t2).toFixed(0) + 'ms',
+    sqlite: (t4 - t3).toFixed(0) + 'ms',
+    total: (t4 - t0).toFixed(0) + 'ms',
+    captured: capturedRemotes.size + '/' + expectedRemoteCount,
+  });
   checkHydrationComplete();
 }
 
@@ -239,7 +254,7 @@ function handleReadColdStorage(req: http.IncomingMessage, res: http.ServerRespon
 
 // --- Char detail handlers ---
 
-function handleGetCharDetail(req: http.IncomingMessage, res: http.ServerResponse, charId: string): void {
+async function handleGetCharDetail(req: http.IncomingMessage, res: http.ServerResponse, charId: string): Promise<void> {
   const db = getDb();
   const row = getCharDetail(db, charId);
   if (!row) {
@@ -248,7 +263,7 @@ function handleGetCharDetail(req: http.IncomingMessage, res: http.ServerResponse
     return;
   }
 
-  const json = decompressColdStorage(row.data);
+  const json = await decompressColdStorage(row.data);
   res.writeHead(200, {
     'content-type': 'application/json',
     'content-length': String(Buffer.byteLength(json)),
@@ -257,18 +272,24 @@ function handleGetCharDetail(req: http.IncomingMessage, res: http.ServerResponse
   res.end(json);
 }
 
-function handleGetAllCharDetails(req: http.IncomingMessage, res: http.ServerResponse): void {
+async function handleGetAllCharDetails(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
   const db = getDb();
   const rows = getAllCharDetails(db);
-  const result: Record<string, any> = {};
 
-  for (const row of rows) {
-    try {
-      const json = decompressColdStorage(row.data);
-      result[row.charId] = JSON.parse(json);
-    } catch {
-      // Skip corrupted entries
-    }
+  const entries = await Promise.all(
+    rows.map(async (row) => {
+      try {
+        const json = await decompressColdStorage(row.data);
+        return [row.charId, JSON.parse(json)] as const;
+      } catch {
+        return null;
+      }
+    }),
+  );
+
+  const result: Record<string, unknown> = {};
+  for (const entry of entries) {
+    if (entry) result[entry[0]] = entry[1];
   }
 
   const body = JSON.stringify(result);
@@ -340,7 +361,20 @@ function main(): void {
 
   const server = http.createServer((req, res) => {
     const route = classifyRequest(req);
-    log.debug('Request', { method: req.method, url: req.url, route: route.type });
+    const reqStart = performance.now();
+
+    // Propagate or generate request ID for cross-service tracing
+    const rid = (typeof req.headers['x-request-id'] === 'string' && req.headers['x-request-id'])
+      || (typeof req.headers['cf-ray'] === 'string' && req.headers['cf-ray'])
+      || crypto.randomBytes(8).toString('hex');
+    req.headers['x-request-id'] = rid;
+
+    log.debug('Request', { rid, method: req.method, url: req.url, route: route.type });
+
+    res.on('finish', () => {
+      const duration = (performance.now() - reqStart).toFixed(0);
+      log.info('Response', { rid, method: req.method, url: req.url, route: route.type, status: String(res.statusCode), ms: duration });
+    });
 
     switch (route.type) {
       // --- DB Proxy endpoints ---
@@ -508,10 +542,10 @@ function main(): void {
         const remoteAuthHeader = typeof req.headers['risu-auth'] === 'string' ? req.headers['risu-auth'] : undefined;
         if (isDbReady() && hydrationState !== 'HOT') {
           // COLD/WARMING: buffer → slim → serve optimized data to client
-          forwardBufferAndTransform(req, res, (status, _headers, body) => {
+          forwardBufferAndTransform(req, res, async (status, _headers, body) => {
             if (status < 200 || status >= 300 || body.length === 0) return null;
             try {
-              captureRemoteFile(body, route.charId, remoteAuthHeader);
+              await captureRemoteFile(body, route.charId, remoteAuthHeader);
               // Serve the deep-slimmed version from SQLite
               const db = getDb();
               const block = getBlock(db, `remote:${route.charId}`);
@@ -526,9 +560,8 @@ function main(): void {
           // HOT bypass (reconcile) or DB not ready: tee as before
           forwardAndTee(req, res, (status, body) => {
             if (status < 200 || status >= 300 || body.length === 0 || !isDbReady()) return;
-            try {
-              reconcileRemoteFile(getDb(), body, route.charId, remoteAuthHeader);
-            } catch (e) { log.error('reconcile remote error', { charId: route.charId, error: String(e) }); }
+            reconcileRemoteFile(getDb(), body, route.charId, remoteAuthHeader)
+              .catch((e) => { log.error('reconcile remote error', { charId: route.charId, error: String(e) }); });
           });
         }
         return;
