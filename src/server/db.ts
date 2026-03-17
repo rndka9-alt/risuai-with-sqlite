@@ -189,6 +189,21 @@ export function blockCount(db: Database.Database): number {
   return row?.cnt ?? 0;
 }
 
+// --- Batch query ---
+
+interface RemoteBlockResult {
+  name: string;
+  data: Buffer;
+}
+
+export function getAllRemoteBlocks(
+  db: Database.Database,
+): RemoteBlockResult[] {
+  return prep<RemoteBlockResult>(db,
+    "SELECT name, data FROM blocks WHERE name LIKE 'remote:%'",
+  ).all();
+}
+
 // --- Chat CRUD ---
 
 export function upsertChat(

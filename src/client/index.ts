@@ -3,11 +3,15 @@
  * Injected into RisuAI HTML via <script defer src="/db/client.js"></script>
  */
 
+import { installBatchRemotes } from './batch-remotes';
 import { install as installFetchPatch } from './fetch-patch';
 import { recoverJobs } from './recovery';
 import { installDetailLoader } from './detail-loader';
 
-// Patch fetch to add target character header
+// Start batch remote prefetch ASAP (before fetch patch so it uses original fetch)
+installBatchRemotes();
+
+// Patch fetch to add target character header + batch intercept
 installFetchPatch();
 
 // Background: load stripped character detail fields

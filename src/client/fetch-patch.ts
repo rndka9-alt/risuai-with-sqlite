@@ -2,7 +2,10 @@
  * Monkey-patch fetch to:
  * 1. Add x-dbproxy-target-char header to POST /proxy2 requests
  * 2. Capture x-dbproxy-job-id from response headers
+ * 3. Serve remote file reads from batch cache when available
  */
+
+import { tryServeBatchRemote } from './batch-remotes';
 
 declare const __pluginApis__: {
   getDatabase(): {
@@ -51,6 +54,23 @@ function findStreamTarget(): string | null {
   }
 }
 
+function getHeader(headers: HeadersInit | undefined, key: string): string | null {
+  if (!headers) return null;
+  if (headers instanceof Headers) return headers.get(key);
+  if (Array.isArray(headers)) {
+    const entry = headers.find(([k]) => k.toLowerCase() === key.toLowerCase());
+    return entry ? entry[1] : null;
+  }
+  const record = headers as Record<string, string>;
+  for (const k of Object.keys(record)) {
+    if (k.toLowerCase() === key.toLowerCase()) return record[k];
+  }
+  return null;
+}
+
+// hex-encoded prefix for "remotes/"
+const REMOTES_HEX_PREFIX = '72656d6f7465732f';
+
 function setHeader(headers: HeadersInit, key: string, value: string): void {
   if (headers instanceof Headers) {
     headers.set(key, value);
@@ -63,7 +83,32 @@ function setHeader(headers: HeadersInit, key: string, value: string): void {
 
 const originalFetch = window.fetch;
 
+// /api/list cache: store raw data so each consumer gets a fresh Response
+let listCachePromise: Promise<{ status: number; headers: Record<string, string>; body: ArrayBuffer } | null> | null = null;
+
 const patchedFetch: typeof fetch = function (input, init) {
+  // Cache GET /api/list — file listing rarely changes during a single page load
+  if (input === '/api/list' && (!init?.method || init.method === 'GET')) {
+    if (!listCachePromise) {
+      listCachePromise = originalFetch.call(window, input, init!).then((resp) => {
+        if (!resp.ok) {
+          listCachePromise = null;
+          return null;
+        }
+        const headers: Record<string, string> = {};
+        resp.headers.forEach((v, k) => { headers[k] = v; });
+        return resp.arrayBuffer().then((body) => ({ status: resp.status, headers, body }));
+      }).catch(() => {
+        listCachePromise = null;
+        return null;
+      });
+    }
+    return listCachePromise.then((cached) => {
+      if (!cached) return originalFetch.call(window, input, init!);
+      return new Response(cached.body.slice(0), { status: cached.status, headers: cached.headers });
+    });
+  }
+
   // Only intercept POST /proxy2
   if (init?.method === 'POST' && (input === '/proxy2' || (typeof input === 'string' && input.startsWith('/proxy2?')))) {
     if (!init.headers) init.headers = {};
@@ -81,6 +126,19 @@ const patchedFetch: typeof fetch = function (input, init) {
       }
       return response;
     });
+  }
+
+  // Intercept GET /api/read for remote files → serve from batch cache
+  if (input === '/api/read' && (!init?.method || init.method === 'GET')) {
+    const filePath = getHeader(init?.headers, 'file-path');
+    if (filePath && filePath.startsWith(REMOTES_HEX_PREFIX)) {
+      const cached = tryServeBatchRemote(filePath);
+      if (cached) {
+        return cached.then((resp) =>
+          resp ?? originalFetch.call(window, input, init!)
+        );
+      }
+    }
   }
 
   return originalFetch.call(window, input, init!);

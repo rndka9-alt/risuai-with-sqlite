@@ -3,7 +3,7 @@ import http from 'http';
 import { PORT, UPSTREAM } from './config';
 import { forwardRequest, forwardAndTee, forwardBufferAndTransform, decodeFilePath } from './proxy';
 import { createCircuitBreaker } from './circuit-breaker';
-import { initDb, resetDb, isDbReady, getDb, getBlock, getBlocksBySource, upsertBlock, upsertChat, upsertCharDetail, getCharDetail, getAllCharDetails, getChat, inTransaction } from './db';
+import { initDb, resetDb, isDbReady, getDb, getBlock, getBlocksBySource, getAllRemoteBlocks, upsertBlock, upsertChat, upsertCharDetail, getCharDetail, getAllCharDetails, getChat, inTransaction } from './db';
 import { parseRisuSave, parseRemoteFile, parseRemotePointer } from './parser';
 import { assembleRisuSave } from './assembler';
 import { slimCharacter, deepSlimCharacter } from './slim';
@@ -40,6 +40,7 @@ type Route =
   | { type: 'db-job-consume'; jobId: string }
   | { type: 'db-char-detail'; charId: string }
   | { type: 'db-char-details' }
+  | { type: 'db-batch-remotes' }
   | { type: 'root-html' }
   | { type: 'passthrough' };
 
@@ -65,6 +66,11 @@ function classifyRequest(req: http.IncomingMessage): Route {
   const consumeMatch = url.match(JOB_CONSUME_RE);
   if (consumeMatch && req.method === 'POST') {
     return { type: 'db-job-consume', jobId: consumeMatch[1] };
+  }
+
+  // Batch remotes endpoint
+  if (url === '/db/batch-remotes' && req.method === 'GET') {
+    return { type: 'db-batch-remotes' };
   }
 
   // Char detail endpoints
@@ -407,6 +413,43 @@ function main(): void {
           return;
         }
         handleGetAllCharDetails(req, res);
+        return;
+      }
+
+      case 'db-batch-remotes': {
+        if (!isDbReady() || hydrationState !== 'HOT') {
+          res.writeHead(204);
+          res.end();
+          return;
+        }
+        const db = getDb();
+        const remotes = getAllRemoteBlocks(db);
+
+        let totalSize = 4;
+        for (const r of remotes) {
+          const charId = r.name.slice(7); // strip 'remote:'
+          totalSize += 1 + Buffer.byteLength(charId) + 4 + r.data.length;
+        }
+
+        const buf = Buffer.alloc(totalSize);
+        let off = 0;
+        buf.writeUInt32LE(remotes.length, off); off += 4;
+
+        for (const r of remotes) {
+          const charId = r.name.slice(7);
+          const charIdBuf = Buffer.from(charId, 'utf-8');
+          buf[off++] = charIdBuf.length;
+          charIdBuf.copy(buf, off); off += charIdBuf.length;
+          buf.writeUInt32LE(r.data.length, off); off += 4;
+          r.data.copy(buf, off); off += r.data.length;
+        }
+
+        res.writeHead(200, {
+          'content-type': 'application/octet-stream',
+          'content-length': String(buf.length),
+          'cache-control': 'no-cache',
+        });
+        res.end(buf);
         return;
       }
 
