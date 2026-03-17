@@ -83,48 +83,7 @@ function setHeader(headers: HeadersInit, key: string, value: string): void {
 
 const originalFetch = window.fetch;
 
-// /api/list cache: store raw data so each consumer gets a fresh Response
-let listCachePromise: Promise<{ status: number; headers: Record<string, string>; body: ArrayBuffer } | null> | null = null;
-
 const patchedFetch: typeof fetch = function (input, init) {
-  // Cache GET /api/list — file listing rarely changes during a single page load
-  if (input === '/api/list' && (!init?.method || init.method === 'GET')) {
-    if (!listCachePromise) {
-      listCachePromise = originalFetch.call(window, input, init!).then((resp) => {
-        if (!resp.ok) {
-          listCachePromise = null;
-          return null;
-        }
-        const headers: Record<string, string> = {};
-        resp.headers.forEach((v, k) => { headers[k] = v; });
-        return resp.arrayBuffer().then((body) => ({ status: resp.status, headers, body }));
-      }).catch(() => {
-        listCachePromise = null;
-        return null;
-      });
-    }
-    return listCachePromise.then((cached) => {
-      if (!cached) return originalFetch.call(window, input, init!);
-      return new Response(cached.body.slice(0), { status: cached.status, headers: cached.headers });
-    });
-  }
-
-  // Invalidate /api/list cache when files change
-  // /api/remove is a GET with side effects — force cache bypass to prevent 304
-  if (input === '/api/remove') {
-    const bypassInit = { ...init, cache: 'no-store' as RequestCache };
-    return originalFetch.call(window, input, bypassInit).then((resp) => {
-      if (resp.ok) listCachePromise = null;
-      return resp;
-    });
-  }
-  if (input === '/api/write' && init?.method === 'POST') {
-    return originalFetch.call(window, input, init!).then((resp) => {
-      if (resp.ok) listCachePromise = null;
-      return resp;
-    });
-  }
-
   // Only intercept POST /proxy2
   if (init?.method === 'POST' && (input === '/proxy2' || (typeof input === 'string' && input.startsWith('/proxy2?')))) {
     if (!init.headers) init.headers = {};
