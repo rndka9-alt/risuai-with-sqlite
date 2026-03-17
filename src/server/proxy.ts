@@ -254,6 +254,48 @@ export function forwardBufferAndTransform(
   });
 }
 
+/** Fetch a file from upstream by path. Returns the response body or null on error. */
+export function fetchFromUpstream(
+  filePath: string,
+  authHeader: string | undefined,
+): Promise<Buffer | null> {
+  return new Promise((resolve) => {
+    const headers: Record<string, string> = {
+      host: UPSTREAM.host,
+      'file-path': encodeFilePath(filePath),
+    };
+    if (authHeader) {
+      headers['risu-auth'] = authHeader;
+    }
+
+    const proxyReq = http.request(
+      {
+        hostname: UPSTREAM.hostname,
+        port: UPSTREAM.port,
+        path: '/api/read',
+        method: 'GET',
+        headers,
+      },
+      (proxyRes) => {
+        if (proxyRes.statusCode! < 200 || proxyRes.statusCode! >= 300) {
+          proxyRes.resume();
+          resolve(null);
+          return;
+        }
+        const chunks: Buffer[] = [];
+        proxyRes.on('data', (chunk: Buffer) => chunks.push(chunk));
+        proxyRes.on('end', () => resolve(Buffer.concat(chunks)));
+      },
+    );
+
+    proxyReq.on('error', (err) => {
+      log.warn('fetchFromUpstream error', { filePath, error: err.message });
+      resolve(null);
+    });
+    proxyReq.end();
+  });
+}
+
 /** Buffer the full request body */
 export function bufferBody(req: http.IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {

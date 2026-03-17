@@ -1,7 +1,7 @@
 import crypto from 'crypto';
 import http from 'http';
 import { PORT, UPSTREAM } from './config';
-import { forwardRequest, forwardAndTee, forwardBufferAndTransform, decodeFilePath } from './proxy';
+import { forwardRequest, forwardAndTee, forwardBufferAndTransform, decodeFilePath, fetchFromUpstream } from './proxy';
 import { createCircuitBreaker } from './circuit-breaker';
 import { initDb, resetDb, isDbReady, getDb, getBlock, getBlocksBySource, getAllRemoteBlocks, upsertBlock, upsertChat, upsertCharDetail, getCharDetail, getAllCharDetails, getChat, inTransaction } from './db';
 import { parseRisuSave, parseRemoteFile, parseRemotePointer } from './parser';
@@ -125,6 +125,10 @@ function classifyRequest(req: http.IncomingMessage): Route {
 let hydrationState: HydrationState = 'COLD';
 const capturedRemotes = new Set<string>();
 let expectedRemoteCount = 0;
+let storedAuthHeader: string | undefined;
+const pendingBatchRequests: Array<{ res: http.ServerResponse; timer: ReturnType<typeof setTimeout> }> = [];
+
+const BATCH_WAIT_TIMEOUT_MS = 30_000;
 
 function checkHydrationComplete(): void {
   if (hydrationState === 'HOT') return;
@@ -133,7 +137,69 @@ function checkHydrationComplete(): void {
   if (capturedRemotes.size >= expectedRemoteCount) {
     hydrationState = 'HOT';
     log.info(`Hydration complete. State: HOT`, { remotesCached: capturedRemotes.size });
+    flushPendingBatchRequests();
   }
+}
+
+function flushPendingBatchRequests(): void {
+  if (pendingBatchRequests.length === 0) return;
+  if (!isDbReady()) return;
+
+  const db = getDb();
+  const remotes = getAllRemoteBlocks(db);
+
+  let totalSize = 4;
+  for (const r of remotes) {
+    const charId = r.name.slice(7);
+    totalSize += 1 + Buffer.byteLength(charId) + 4 + r.data.length;
+  }
+
+  const buf = Buffer.alloc(totalSize);
+  let off = 0;
+  buf.writeUInt32LE(remotes.length, off); off += 4;
+  for (const r of remotes) {
+    const charId = r.name.slice(7);
+    const charIdBuf = Buffer.from(charId, 'utf-8');
+    buf[off++] = charIdBuf.length;
+    charIdBuf.copy(buf, off); off += charIdBuf.length;
+    buf.writeUInt32LE(r.data.length, off); off += 4;
+    r.data.copy(buf, off); off += r.data.length;
+  }
+
+  log.info('Flushing pending batch-remotes', { count: String(pendingBatchRequests.length), remotes: String(remotes.length) });
+
+  for (const pending of pendingBatchRequests) {
+    clearTimeout(pending.timer);
+    if (!pending.res.writableEnded) {
+      pending.res.writeHead(200, {
+        'content-type': 'application/octet-stream',
+        'content-length': String(buf.length),
+        'cache-control': 'no-cache',
+      });
+      pending.res.end(buf);
+    }
+  }
+  pendingBatchRequests.length = 0;
+}
+
+/** Proactively fetch all remotes from upstream after database.bin is captured. */
+async function proactiveHydration(charIds: string[], authHeader: string | undefined): Promise<void> {
+  log.info('Proactive hydration started', { remotes: String(charIds.length) });
+  const t0 = performance.now();
+
+  await Promise.all(
+    charIds.map(async (charId) => {
+      if (capturedRemotes.has(charId)) return;
+      const body = await fetchFromUpstream(`remotes/${charId}.local.bin`, authHeader);
+      if (body && body.length > 0) {
+        await captureRemoteFile(body, charId, authHeader);
+      } else {
+        log.warn('Proactive fetch failed', { charId });
+      }
+    }),
+  );
+
+  log.info('Proactive hydration finished', { ms: (performance.now() - t0).toFixed(0), captured: capturedRemotes.size + '/' + expectedRemoteCount });
 }
 
 function captureDatabaseBin(body: Buffer, authHeader: string | undefined): void {
@@ -146,12 +212,18 @@ function captureDatabaseBin(body: Buffer, authHeader: string | undefined): void 
     return;
   }
 
+  storedAuthHeader = authHeader;
+  const charIds: string[] = [];
+
   inTransaction(db, () => {
     for (const block of result.blocks) {
       upsertBlock(db, block.name, block.type, 'database.bin', block.compression, block.data, block.hash);
       if (block.type === RisuSaveType.REMOTE) {
         const ptr = parseRemotePointer(block.data);
-        if (ptr) expectedRemoteCount++;
+        if (ptr) {
+          expectedRemoteCount++;
+          charIds.push(ptr.charId);
+        }
       }
     }
   });
@@ -162,6 +234,12 @@ function captureDatabaseBin(body: Buffer, authHeader: string | undefined): void 
     remotesExpected: expectedRemoteCount,
   });
   checkHydrationComplete();
+
+  // Proactively fetch all remotes from upstream (non-blocking)
+  if (hydrationState !== 'HOT' && charIds.length > 0) {
+    proactiveHydration(charIds, authHeader)
+      .catch((e) => log.error('Proactive hydration error', { error: String(e) }));
+  }
 }
 
 async function captureRemoteFile(body: Buffer, charId: string, authHeader: string | undefined): Promise<void> {
@@ -451,9 +529,30 @@ function main(): void {
       }
 
       case 'db-batch-remotes': {
-        if (!isDbReady() || hydrationState !== 'HOT') {
+        if (!isDbReady()) {
           res.writeHead(204);
           res.end();
+          return;
+        }
+        if (hydrationState !== 'HOT') {
+          // Hold request until hydration completes (proactive fetch in progress)
+          const timer = setTimeout(() => {
+            const idx = pendingBatchRequests.findIndex((p) => p.res === res);
+            if (idx !== -1) pendingBatchRequests.splice(idx, 1);
+            if (!res.writableEnded) {
+              log.warn('batch-remotes timeout, sending 204');
+              res.writeHead(204);
+              res.end();
+            }
+          }, BATCH_WAIT_TIMEOUT_MS);
+          pendingBatchRequests.push({ res, timer });
+          res.on('close', () => {
+            const idx = pendingBatchRequests.findIndex((p) => p.res === res);
+            if (idx !== -1) {
+              clearTimeout(pendingBatchRequests[idx].timer);
+              pendingBatchRequests.splice(idx, 1);
+            }
+          });
           return;
         }
         const db = getDb();
