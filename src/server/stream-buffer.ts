@@ -2,7 +2,7 @@ import http from 'http';
 import crypto from 'crypto';
 import Database from 'better-sqlite3';
 import { UPSTREAM } from './config';
-import { createJob, appendJobResponse, updateJobStatus, getJob, getActiveJobs, deleteJob } from './db';
+import { createJob, appendJobResponse, updateJobStatus, getJob, getActiveJobs, deleteJob, isDbReady, getDb } from './db';
 import * as log from './logger';
 
 // --- Active stream tracking (in-memory, complements SQLite) ---
@@ -14,9 +14,46 @@ interface ActiveStream {
   lineBuffer: string;
   subscribers: Set<http.ServerResponse>; // SSE subscribers for replay+live
   clientDisconnected: boolean;
+  createdAt: number;
 }
 
 const activeStreams = new Map<string, ActiveStream>();
+
+/** Zombie stream cleanup: upstream 무응답 시 30분 후 정리 */
+const STREAM_TTL_MS = 30 * 60 * 1000;
+
+const streamCleanupTimer = setInterval(() => {
+  const now = Date.now();
+  for (const [jobId, stream] of activeStreams) {
+    if (now - stream.createdAt < STREAM_TTL_MS) continue;
+
+    log.warn('Stale stream cleaned up', { jobId, ageSeconds: String(Math.round((now - stream.createdAt) / 1000)) });
+
+    if (!stream.proxyReq.destroyed) {
+      stream.proxyReq.destroy();
+    }
+
+    try {
+      if (isDbReady()) {
+        const db = getDb();
+        appendJobResponse(db, jobId, stream.accumulatedText);
+        updateJobStatus(db, jobId, 'failed', 'stream timeout');
+      }
+    } catch {
+      // best-effort
+    }
+
+    for (const sub of stream.subscribers) {
+      if (!sub.writableEnded) {
+        sub.write(`data: ${JSON.stringify({ type: 'error', error: 'stream timeout' })}\n\n`);
+        sub.end();
+      }
+    }
+
+    activeStreams.delete(jobId);
+  }
+}, 60_000);
+streamCleanupTimer.unref();
 
 // --- SSE Delta Parsing (forked from sync server) ---
 
@@ -119,6 +156,7 @@ export function handleProxy2(
         lineBuffer: '',
         subscribers: new Set(),
         clientDisconnected: false,
+        createdAt: Date.now(),
       };
       activeStreams.set(jobId, stream);
 
