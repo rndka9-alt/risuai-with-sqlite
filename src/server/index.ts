@@ -42,6 +42,7 @@ type Route =
   | { type: 'db-char-details' }
   | { type: 'db-batch-remotes' }
   | { type: 'root-html' }
+  | { type: 'list-files' }
   | { type: 'passthrough' };
 
 function classifyRequest(req: http.IncomingMessage): Route {
@@ -90,6 +91,11 @@ function classifyRequest(req: http.IncomingMessage): Route {
   // Root HTML (for script injection)
   if (url === '/' && req.method === 'GET') {
     return { type: 'root-html' };
+  }
+
+  // GET /api/list → .meta.meta 필터링
+  if (url === '/api/list' && req.method === 'GET') {
+    return { type: 'list-files' };
   }
 
   // File API routes
@@ -708,6 +714,26 @@ function main(): void {
           catch (err) { log.warn('write-remote error, bypassing', { charId: route.charId, error: err instanceof Error ? err.message : String(err) }); }
         }
         forwardRequest(req, res);
+        return;
+      }
+
+      // --- GET /api/list → .meta.meta 이상 필터링 ---
+      // risuai 클라이언트 버그: cleanup 루프가 .meta 파일에도 .meta를 덧붙여
+      // .meta.meta.meta... 체인이 무한 성장 → ENAMETOOLONG 500.
+      // .meta.meta 이상을 list에서 숨겨 체인 성장을 차단한다.
+      case 'list-files': {
+        forwardBufferAndTransform(req, res, (status, _headers, body) => {
+          if (status < 200 || status >= 300) return null;
+          try {
+            const data = JSON.parse(body.toString('utf-8'));
+            if (data.content && Array.isArray(data.content)) {
+              data.content = data.content.filter((entry: string) => !entry.includes('.meta.meta'));
+            }
+            return Buffer.from(JSON.stringify(data), 'utf-8');
+          } catch {
+            return null;
+          }
+        });
         return;
       }
 
