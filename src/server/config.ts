@@ -17,6 +17,13 @@ export const LOG_LEVEL = process.env.LOG_LEVEL || 'info';
 /** 프록시 모듈 간 공유하는 클라이언트 식별 헤더 */
 export const CLIENT_ID_HEADER = 'x-proxy-client-id';
 
+// Custom headers
+export const FILE_PATH_HEADER = 'file-path';
+export const REQUEST_ID_HEADER = 'x-request-id';
+export const RISU_AUTH_HEADER = 'risu-auth';
+export const DBPROXY_TARGET_HEADER = 'x-dbproxy-target-char';
+export const DBPROXY_JOB_ID_HEADER = 'x-dbproxy-job-id';
+
 // Circuit breaker
 export const CB_FAILURE_THRESHOLD = parseInt(
   process.env.CB_FAILURE_THRESHOLD || '5',

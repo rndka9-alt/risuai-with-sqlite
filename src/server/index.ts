@@ -1,6 +1,6 @@
 import crypto from 'crypto';
 import http from 'http';
-import { PORT, UPSTREAM, CLIENT_ID_HEADER } from './config';
+import { PORT, UPSTREAM, CLIENT_ID_HEADER, REQUEST_ID_HEADER, RISU_AUTH_HEADER, FILE_PATH_HEADER } from './config';
 import { forwardRequest, forwardAndTee, forwardBufferAndTransform, decodeFilePath, fetchFromUpstream } from './proxy';
 import { createCircuitBreaker } from './circuit-breaker';
 import { initDb, resetDb, isDbReady, getDb, getBlock, getBlocksBySource, getAllRemoteBlocks, upsertBlock, upsertChat, upsertCharDetail, getCharDetail, getAllCharDetails, getChat, inTransaction } from './db';
@@ -442,10 +442,10 @@ function main(): void {
     const reqStart = performance.now();
 
     // Propagate or generate request ID for cross-service tracing
-    const rid = (typeof req.headers['x-request-id'] === 'string' && req.headers['x-request-id'])
+    const rid = (typeof req.headers[REQUEST_ID_HEADER] === 'string' && req.headers[REQUEST_ID_HEADER])
       || (typeof req.headers['cf-ray'] === 'string' && req.headers['cf-ray'])
       || crypto.randomBytes(8).toString('hex');
-    req.headers['x-request-id'] = rid;
+    req.headers[REQUEST_ID_HEADER] = rid;
 
     // Ensure client ID header is always present — client patch may not be loaded
     if (typeof req.headers[CLIENT_ID_HEADER] !== 'string') {
@@ -458,7 +458,7 @@ function main(): void {
       const duration = (performance.now() - reqStart).toFixed(0);
       const logFields: Record<string, string | undefined> = { rid, method: req.method, url: req.url, route: route.type, status: String(res.statusCode), ms: duration };
       // file-path 헤더가 있으면 디코딩해서 로그에 포함 (backup 이슈 추적용)
-      const rawFp = req.headers['file-path'];
+      const rawFp = req.headers[FILE_PATH_HEADER];
       if (typeof rawFp === 'string' && rawFp.length > 0) {
         logFields.filePath = decodeFilePath(req) ?? rawFp;
       }
@@ -626,7 +626,7 @@ function main(): void {
             log.warn('read-database fallback to upstream', { error: err instanceof Error ? err.message : String(err) });
           }
         }
-        const dbAuthHeader = typeof req.headers['risu-auth'] === 'string' ? req.headers['risu-auth'] : undefined;
+        const dbAuthHeader = typeof req.headers[RISU_AUTH_HEADER] === 'string' ? req.headers[RISU_AUTH_HEADER] : undefined;
         forwardAndTee(req, res, (status, body) => {
           if (status < 200 || status >= 300 || body.length === 0 || !isDbReady()) return;
           try {
@@ -649,7 +649,7 @@ function main(): void {
             log.warn('read-remote fallback to upstream', { charId: route.charId, error: err instanceof Error ? err.message : String(err) });
           }
         }
-        const remoteAuthHeader = typeof req.headers['risu-auth'] === 'string' ? req.headers['risu-auth'] : undefined;
+        const remoteAuthHeader = typeof req.headers[RISU_AUTH_HEADER] === 'string' ? req.headers[RISU_AUTH_HEADER] : undefined;
         if (isDbReady() && hydrationState !== 'HOT') {
           // COLD/WARMING: buffer → slim → serve optimized data to client
           forwardBufferAndTransform(req, res, async (status, _headers, body) => {

@@ -1,10 +1,10 @@
 import http from 'http';
-import { UPSTREAM } from './config';
+import { UPSTREAM, FILE_PATH_HEADER, REQUEST_ID_HEADER, RISU_AUTH_HEADER } from './config';
 import * as log from './logger';
 
 /** Decode hex-encoded file-path header to UTF-8 string */
 export function decodeFilePath(req: http.IncomingMessage): string | null {
-  const raw = req.headers['file-path'];
+  const raw = req.headers[FILE_PATH_HEADER];
   if (typeof raw !== 'string' || raw.length === 0) return null;
   if (!/^[0-9a-fA-F]+$/.test(raw)) return null;
   return Buffer.from(raw, 'hex').toString('utf-8');
@@ -21,7 +21,7 @@ export function forwardRequest(
   res: http.ServerResponse,
 ): void {
   const t0 = performance.now();
-  const rid = req.headers['x-request-id'] || '';
+  const rid = req.headers[REQUEST_ID_HEADER] || '';
 
   const proxyReq = http.request(
     {
@@ -60,7 +60,7 @@ export function forwardAndTee(
   onBody: (statusCode: number, body: Buffer) => void,
 ): void {
   const t0 = performance.now();
-  const rid = req.headers['x-request-id'] || '';
+  const rid = req.headers[REQUEST_ID_HEADER] || '';
 
   const proxyReq = http.request(
     {
@@ -152,12 +152,12 @@ export function writeToUpstream(
 ): void {
   const headers: Record<string, string> = {
     host: UPSTREAM.host,
-    'file-path': encodeFilePath(filePath),
+    [FILE_PATH_HEADER]: encodeFilePath(filePath),
     'content-type': 'application/octet-stream',
     'content-length': String(data.length),
   };
   if (authHeader) {
-    headers['risu-auth'] = authHeader;
+    headers[RISU_AUTH_HEADER] = authHeader;
   }
 
   const proxyReq = http.request(
@@ -191,7 +191,7 @@ export function forwardBufferAndTransform(
   transform: (statusCode: number, headers: http.IncomingHttpHeaders, body: Buffer) => Promise<Buffer | null> | Buffer | null,
 ): void {
   const t0 = performance.now();
-  const rid = req.headers['x-request-id'] || '';
+  const rid = req.headers[REQUEST_ID_HEADER] || '';
 
   const proxyReq = http.request(
     {
@@ -262,10 +262,10 @@ export function fetchFromUpstream(
   return new Promise((resolve) => {
     const headers: Record<string, string> = {
       host: UPSTREAM.host,
-      'file-path': encodeFilePath(filePath),
+      [FILE_PATH_HEADER]: encodeFilePath(filePath),
     };
     if (authHeader) {
-      headers['risu-auth'] = authHeader;
+      headers[RISU_AUTH_HEADER] = authHeader;
     }
 
     const proxyReq = http.request(

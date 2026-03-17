@@ -1,6 +1,7 @@
 import http from 'http';
 import crypto from 'crypto';
 import Database from 'better-sqlite3';
+import { RISU_AUTH_HEADER } from './config';
 import { bufferBody, forwardBuffered, writeToUpstream } from './proxy';
 import { parseRisuSave, parseRemoteFile } from './parser';
 import { slimCharacter, deepSlimCharacter, mergeCharacterDetail, isColdMarker, COLD_STORAGE_HEADER } from './slim';
@@ -69,8 +70,8 @@ export async function handleWriteRemote(
   db: Database.Database,
 ): Promise<void> {
   let body = await bufferBody(req);
-  const authHeader = typeof req.headers['risu-auth'] === 'string'
-    ? req.headers['risu-auth']
+  const authHeader = typeof req.headers[RISU_AUTH_HEADER] === 'string'
+    ? req.headers[RISU_AUTH_HEADER]
     : undefined;
 
   // Merge stored detail if fields were stripped (client hadn't loaded detail yet)

@@ -1,7 +1,7 @@
 import http from 'http';
 import crypto from 'crypto';
 import Database from 'better-sqlite3';
-import { UPSTREAM } from './config';
+import { UPSTREAM, DBPROXY_TARGET_HEADER, DBPROXY_JOB_ID_HEADER } from './config';
 import { createJob, appendJobResponse, updateJobStatus, getJob, getActiveJobs, deleteJob, isDbReady, getDb } from './db';
 import * as log from './logger';
 
@@ -103,8 +103,8 @@ export function handleProxy2(
   res: http.ServerResponse,
   db: Database.Database,
 ): void {
-  const targetCharId = typeof req.headers['x-dbproxy-target-char'] === 'string'
-    ? req.headers['x-dbproxy-target-char']
+  const targetCharId = typeof req.headers[DBPROXY_TARGET_HEADER] === 'string'
+    ? req.headers[DBPROXY_TARGET_HEADER]
     : null;
 
   const jobId = crypto.randomUUID();
@@ -117,7 +117,7 @@ export function handleProxy2(
     ...req.headers,
     host: UPSTREAM.host,
   };
-  delete headers['x-dbproxy-target-char'];
+  delete headers[DBPROXY_TARGET_HEADER];
 
   const proxyReq = http.request(
     {
@@ -161,7 +161,7 @@ export function handleProxy2(
       activeStreams.set(jobId, stream);
 
       // Send job ID to client via custom header
-      const responseHeaders = { ...proxyRes.headers, 'x-dbproxy-job-id': jobId };
+      const responseHeaders = { ...proxyRes.headers, [DBPROXY_JOB_ID_HEADER]: jobId };
       res.writeHead(proxyRes.statusCode!, responseHeaders);
 
       // Detect client disconnect
