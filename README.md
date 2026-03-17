@@ -106,11 +106,11 @@ Client GET /api/read
 | Phase | 대상 | 처리 |
 |-------|------|------|
 | Chat Slim | `chats[]` 배열 | 채팅 메시지를 cold marker로 교체. 클라이언트의 `preLoadChat()` → `coldstorage/` 로 on-demand 로딩 |
-| Deep Slim | 31개 heavy fields | `desc`, `systemPrompt`, `globalLore`, `triggerscript` 등을 빈 값으로 교체. `char_details` 테이블에 gzip 압축 저장. `__strippedFields` 마커 배열 삽입 |
+| Deep Slim | 29개 heavy fields | `desc`, `systemPrompt`, `globalLore`, `triggerscript` 등을 빈 값으로 교체. `char_details` 테이블에 gzip 압축 저장. `__strippedFields` 마커 배열 삽입 |
 
 Deep Slim 후 클라이언트에 전달되는 캐릭터 데이터:
 - 유지: `name`, `image`, `type`, `chaId`, `creatorNotes`, `tags`, `trashTime` 등 UI 표시용 필드
-- 제거: `desc`, `systemPrompt`, `personality`, `scenario`, `globalLore`, `firstMessage` 등 31개 필드
+- 제거: `desc`, `systemPrompt`, `personality`, `scenario`, `globalLore`, `firstMessage` 등 29개 필드
 - 클라이언트 JS가 백그라운드에서 `/db/char-details` 호출 → 메모리에 merge → `__strippedFields` 제거
 
 ### Write Path
@@ -146,7 +146,8 @@ RisuAI HTML에 `<script defer src="/db/client.js">` 를 자동 주입한다.
 
 | 모듈 | 역할 |
 |------|------|
-| `fetch-patch.ts` | fetch 패치: `/proxy2` 요청에 target-char 헤더 주입, job ID 캡처 |
+| `batch-remotes.ts` | 기동 시 `/db/batch-remotes`로 전체 remote 캐릭터를 한 번에 prefetch, fetch-patch에서 개별 read 요청을 캐시에서 서빙 |
+| `fetch-patch.ts` | fetch 패치: `/proxy2` 요청에 target-char 헤더 주입 + job ID 캡처, `/api/list` 응답 캐싱, remote 파일 읽기를 batch cache에서 서빙 |
 | `detail-loader.ts` | 풀스크린 로딩 오버레이 + deep-slim detail 백그라운드 fetch → 메모리 merge |
 | `recovery.ts` | 페이지 새로고침 후 streaming job 복구 (SSE 재연결, 완료 job 적용) |
 | `notification.ts` | 토스트 알림 UI |
@@ -167,6 +168,7 @@ RisuAI HTML에 `<script defer src="/db/client.js">` 를 자동 주입한다.
 | 경로 | 메서드 | 설명 |
 |------|--------|------|
 | `/db/client.js` | GET | 클라이언트 번들 (IIFE) |
+| `/db/batch-remotes` | GET | 전체 remote 캐릭터를 한 번에 반환 (바이너리) |
 | `/db/char-detail/{charId}` | GET | 개별 캐릭터의 stripped detail 반환 (JSON) |
 | `/db/char-details` | GET | 전체 캐릭터 detail 일괄 반환 (JSON) |
 | `/db/jobs/active` | GET | 활성 streaming job 목록 |
@@ -226,8 +228,9 @@ CREATE INDEX idx_chats_char ON chats(char_id);
 ```
 src/
 ├── client/                    # 브라우저 IIFE 번들 (RisuAI HTML에 주입)
-│   ├── index.ts              # 진입점: fetch-patch + detail-loader + recovery 연결
-│   ├── fetch-patch.ts        # fetch 패치 (proxy2에 target-char 헤더 주입)
+│   ├── index.ts              # 진입점: batch-remotes + fetch-patch + detail-loader + recovery 연결
+│   ├── batch-remotes.ts      # /db/batch-remotes로 전체 remote 캐릭터 prefetch + 캐시
+│   ├── fetch-patch.ts        # fetch 패치 (proxy2 헤더 주입, /api/list 캐싱, batch cache 서빙)
 │   ├── detail-loader.ts      # 풀스크린 오버레이 + deep-slim detail 백그라운드 로딩
 │   ├── recovery.ts           # 페이지 새로고침 후 streaming job 복구
 │   └── notification.ts       # 토스트 UI
@@ -237,9 +240,10 @@ src/
 │   ├── proxy.ts              # upstream forward (bypass의 기본 동작)
 │   ├── circuit-breaker.ts    # 실패 감지, bypass 모드 전환
 │   ├── db.ts                 # SQLite 연결, CRUD (blocks, chats, char_details, jobs)
+│   ├── logger.ts             # 로그 레벨 관리 (debug/info/warn/error)
 │   ├── parser.ts             # RisuSave 바이너리 파싱
 │   ├── assembler.ts          # 블록 → RisuSave 바이너리 재조립
-│   ├── slim.ts               # Chat cold storage + Deep slim (31개 heavy fields 분리)
+│   ├── slim.ts               # Chat cold storage + Deep slim (29개 heavy fields 분리)
 │   ├── write-handler.ts      # Write 인터셉트 (__strippedFields merge + re-slim)
 │   ├── cold-compat.ts        # Cold storage 호환 (fflate 압축/해제)
 │   ├── reconcile.ts          # Passive FS↔DB 정합성 검사 (bypass 시 hash 비교)
@@ -257,6 +261,7 @@ src/
 PORT=3001                        # DB Proxy 리슨 포트
 UPSTREAM=http://localhost:6001   # RisuAI (또는 Sync 서버) 주소
 DB_PATH=./data/proxy.db          # SQLite 파일 경로
+LOG_LEVEL=info                   # 로그 레벨 (debug/info/warn/error)
 CB_FAILURE_THRESHOLD=5           # Circuit breaker 실패 임계값
 CB_RESET_TIMEOUT_MS=30000        # Circuit breaker 리셋 타임아웃 (ms)
 ```
