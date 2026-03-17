@@ -107,6 +107,19 @@ export function isDbReady(): boolean {
   return _db !== null;
 }
 
+/**
+ * Clear all cached data so hydration starts fresh.
+ * Called on startup to avoid serving stale data from a previous run.
+ */
+export function resetDb(db: Database.Database): void {
+  db.exec(`
+    DELETE FROM blocks;
+    DELETE FROM chats;
+    DELETE FROM char_details;
+    DELETE FROM jobs;
+  `);
+}
+
 // --- Typed prepare helper ---
 // better-sqlite3's prepare() accepts a Result generic.
 // We use this instead of a statement cache to avoid `as` type assertions.

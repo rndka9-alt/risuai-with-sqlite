@@ -1,9 +1,9 @@
 import crypto from 'crypto';
 import http from 'http';
 import { PORT, UPSTREAM } from './config';
-import { forwardRequest, forwardAndTee, decodeFilePath } from './proxy';
+import { forwardRequest, forwardAndTee, forwardBufferAndTransform, decodeFilePath } from './proxy';
 import { createCircuitBreaker } from './circuit-breaker';
-import { initDb, isDbReady, getDb, getBlock, getBlocksBySource, upsertBlock, upsertChat, upsertCharDetail, getCharDetail, getAllCharDetails, getChat, inTransaction } from './db';
+import { initDb, resetDb, isDbReady, getDb, getBlock, getBlocksBySource, upsertBlock, upsertChat, upsertCharDetail, getCharDetail, getAllCharDetails, getChat, inTransaction } from './db';
 import { parseRisuSave, parseRemoteFile, parseRemotePointer } from './parser';
 import { assembleRisuSave } from './assembler';
 import { slimCharacter, deepSlimCharacter } from './slim';
@@ -325,8 +325,9 @@ const cb = createCircuitBreaker();
 
 function main(): void {
   try {
-    initDb();
-    log.info('SQLite initialized');
+    const db = initDb();
+    resetDb(db);
+    log.info('SQLite initialized (fresh start)');
   } catch (err) {
     log.error('SQLite init failed, running in pure proxy mode', { error: String(err) });
   }
@@ -462,13 +463,31 @@ function main(): void {
           }
         }
         const remoteAuthHeader = typeof req.headers['risu-auth'] === 'string' ? req.headers['risu-auth'] : undefined;
-        forwardAndTee(req, res, (status, body) => {
-          if (status < 200 || status >= 300 || body.length === 0 || !isDbReady()) return;
-          try {
-            if (hydrationState === 'HOT') reconcileRemoteFile(getDb(), body, route.charId, remoteAuthHeader);
-            else captureRemoteFile(body, route.charId, remoteAuthHeader);
-          } catch (e) { log.error('capture/reconcile remote error', { charId: route.charId, error: String(e) }); }
-        });
+        if (isDbReady() && hydrationState !== 'HOT') {
+          // COLD/WARMING: buffer → slim → serve optimized data to client
+          forwardBufferAndTransform(req, res, (status, _headers, body) => {
+            if (status < 200 || status >= 300 || body.length === 0) return null;
+            try {
+              captureRemoteFile(body, route.charId, remoteAuthHeader);
+              // Serve the deep-slimmed version from SQLite
+              const db = getDb();
+              const block = getBlock(db, `remote:${route.charId}`);
+              if (block) {
+                log.debug('Serving slimmed remote during hydration', { charId: route.charId });
+                return block.data;
+              }
+            } catch (e) { log.error('capture remote error during hydration', { charId: route.charId, error: String(e) }); }
+            return null; // fallback to original body
+          });
+        } else {
+          // HOT bypass (reconcile) or DB not ready: tee as before
+          forwardAndTee(req, res, (status, body) => {
+            if (status < 200 || status >= 300 || body.length === 0 || !isDbReady()) return;
+            try {
+              reconcileRemoteFile(getDb(), body, route.charId, remoteAuthHeader);
+            } catch (e) { log.error('reconcile remote error', { charId: route.charId, error: String(e) }); }
+          });
+        }
         return;
       }
 

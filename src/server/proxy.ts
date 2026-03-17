@@ -165,6 +165,58 @@ export function writeToUpstream(
   });
 }
 
+/**
+ * Forward a request to upstream, buffer the response, transform it,
+ * then send the transformed body to the client.
+ * Used in hydration path where we want to slim data before serving.
+ */
+export function forwardBufferAndTransform(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  transform: (statusCode: number, headers: http.IncomingHttpHeaders, body: Buffer) => Buffer | null,
+): void {
+  const proxyReq = http.request(
+    {
+      hostname: UPSTREAM.hostname,
+      port: UPSTREAM.port,
+      path: req.url,
+      method: req.method,
+      headers: { ...req.headers, host: UPSTREAM.host },
+    },
+    (proxyRes) => {
+      const chunks: Buffer[] = [];
+      proxyRes.on('data', (chunk: Buffer) => chunks.push(chunk));
+      proxyRes.on('end', () => {
+        const body = Buffer.concat(chunks);
+
+        let transformed: Buffer | null = null;
+        try {
+          transformed = transform(proxyRes.statusCode!, proxyRes.headers, body);
+        } catch (err) {
+          log.error('Transform error, sending original', { error: String(err) });
+        }
+
+        const output = transformed ?? body;
+        const headers = { ...proxyRes.headers };
+        headers['content-length'] = String(output.length);
+        delete headers['content-encoding'];
+        res.writeHead(proxyRes.statusCode!, headers);
+        res.end(output);
+      });
+    },
+  );
+
+  req.pipe(proxyReq);
+
+  proxyReq.on('error', (err) => {
+    log.error('Upstream error', { error: err.message });
+    if (!res.headersSent) {
+      res.writeHead(502, { 'content-type': 'text/plain' });
+    }
+    res.end('Bad Gateway');
+  });
+}
+
 /** Buffer the full request body */
 export function bufferBody(req: http.IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
