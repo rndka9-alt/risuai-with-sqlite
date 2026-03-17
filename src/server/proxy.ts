@@ -150,13 +150,18 @@ export function writeToUpstream(
     headers['risu-auth'] = authHeader;
   }
 
-  const proxyReq = http.request({
-    hostname: UPSTREAM.hostname,
-    port: UPSTREAM.port,
-    path: '/api/write',
-    method: 'POST',
-    headers,
-  });
+  const proxyReq = http.request(
+    {
+      hostname: UPSTREAM.hostname,
+      port: UPSTREAM.port,
+      path: '/api/write',
+      method: 'POST',
+      headers,
+    },
+    (proxyRes) => {
+      proxyRes.resume();
+    },
+  );
 
   proxyReq.end(data);
 
