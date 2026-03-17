@@ -112,17 +112,20 @@ function mergeDetail(char: any, detail: Record<string, any>): void {
   char.reloadKeys = (char.reloadKeys || 0) + 1;
 }
 
-async function loadAllDetails(): Promise<void> {
-  if (typeof __pluginApis__ === 'undefined') return;
+/** Returns true if stripped fields were found and loading was needed. */
+async function loadAllDetails(): Promise<boolean> {
+  if (typeof __pluginApis__ === 'undefined') return false;
   const db = __pluginApis__?.getDatabase();
-  if (!db?.characters) return;
+  if (!db?.characters) return false;
 
   // No stripped fields → proxy is in COLD state or no deep-slim applied
   const needsDetail = db.characters.some((c) => c && Array.isArray(c.__strippedFields));
-  if (!needsDetail) return;
+  if (!needsDetail) return false;
+
+  showOverlay();
 
   const resp = await fetch('/db/char-details');
-  if (!resp.ok) return;
+  if (!resp.ok) return true;
 
   const details: DetailMap = await resp.json();
 
@@ -133,6 +136,7 @@ async function loadAllDetails(): Promise<void> {
       mergeDetail(char, detail);
     }
   }
+  return true;
 }
 
 // --- Main loop ---
@@ -144,17 +148,20 @@ const FAILSAFE_TIMEOUT = 35_000; // dismiss overlay no matter what
 function waitForApiAndLoad(): void {
   let attempts = 0;
 
-  // Failsafe: always dismiss overlay eventually
-  const failsafe = setTimeout(dismissOverlay, FAILSAFE_TIMEOUT);
-
   const check = () => {
     attempts++;
 
     if (typeof __pluginApis__ !== 'undefined' && __pluginApis__?.getDatabase()?.characters) {
+      let failsafe: ReturnType<typeof setTimeout> | undefined;
       loadAllDetails()
+        .then((needed) => {
+          if (needed) {
+            failsafe = setTimeout(dismissOverlay, FAILSAFE_TIMEOUT);
+          }
+        })
         .catch((err) => console.error('[DB-Proxy] detail loader error:', err))
         .finally(() => {
-          clearTimeout(failsafe);
+          if (failsafe) clearTimeout(failsafe);
           dismissOverlay();
         });
       return;
@@ -162,10 +169,6 @@ function waitForApiAndLoad(): void {
 
     if (attempts < API_POLL_MAX) {
       setTimeout(check, API_POLL_INTERVAL);
-    } else {
-      // Gave up waiting for __pluginApis__
-      clearTimeout(failsafe);
-      dismissOverlay();
     }
   };
 
@@ -173,6 +176,5 @@ function waitForApiAndLoad(): void {
 }
 
 export function installDetailLoader(): void {
-  showOverlay();
   waitForApiAndLoad();
 }
