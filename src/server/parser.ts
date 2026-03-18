@@ -1,6 +1,7 @@
 import crypto from 'crypto';
 import zlib from 'zlib';
 import { RisuSaveType, toRisuSaveType, type ParsedBlock } from '../shared/types';
+import * as log from './logger';
 
 const MAGIC_HEADER = Buffer.from('RISUSAVE\0', 'utf-8');
 
@@ -53,8 +54,8 @@ export function parseRisuSave(
       if (compression === 1) {
         try {
           data = zlib.gunzipSync(rawData);
-        } catch {
-          // Decompression failure: skip block
+        } catch (err) {
+          log.debug('Block decompression failed, skipping', { name, error: String(err) });
           continue;
         }
       } else {
@@ -78,11 +79,12 @@ export function parseRisuSave(
           if (Array.isArray(rootData.__directory)) {
             directory = rootData.__directory;
           }
-        } catch {
-          // Ignore parse failure
+        } catch (err) {
+          log.debug('ROOT block JSON parse failed, skipping directory extraction', { error: String(err) });
         }
       }
-    } catch {
+    } catch (err) {
+      log.debug('Block parse error, stopping', { offset, error: String(err) });
       break;
     }
   }
@@ -123,8 +125,8 @@ export function parseRemotePointer(
     if (meta.v === 1 && typeof meta.name === 'string') {
       return { charId: meta.name, originalType: meta.type };
     }
-  } catch {
-    // Ignore
+  } catch (err) {
+    log.debug('Remote pointer parse failed', { error: String(err) });
   }
   return null;
 }

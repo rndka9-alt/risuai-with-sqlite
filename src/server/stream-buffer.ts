@@ -39,8 +39,8 @@ const streamCleanupTimer = setInterval(() => {
         appendJobResponse(db, jobId, stream.accumulatedText);
         updateJobStatus(db, jobId, 'failed', 'stream timeout');
       }
-    } catch {
-      // best-effort
+    } catch (err) {
+      log.debug('Zombie stream DB cleanup failed', { jobId, error: String(err) });
     }
 
     for (const sub of stream.subscribers) {
@@ -88,8 +88,8 @@ function parseSSEDeltas(raw: string): string[] {
         }
         continue;
       }
-    } catch {
-      // JSON parse failure — skip
+    } catch (err) {
+      log.debug('SSE line JSON parse failed, skipping', { line, error: String(err) });
     }
   }
 
