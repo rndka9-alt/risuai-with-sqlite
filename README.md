@@ -43,9 +43,9 @@ Client (Browser) → DB-Proxy (:3001) → RisuAI (:6001) → Filesystem
 
 Sync 서버와 체이닝 시:
 ```
-Client → DB-Proxy (:3001) → Sync (:3000) → RisuAI (:6001) → Filesystem
-              ↕
-           SQLite
+Client → Sync (:3000) → DB-Proxy (:3001) → RisuAI (:6001) → Filesystem
+                              ↕
+                           SQLite
 ```
 
 ### 핵심 원칙
