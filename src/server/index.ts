@@ -15,6 +15,7 @@ import { handleProxy2, handleGetActiveJobs, handleJobStream, handleJobAbort, han
 import { getClientJs, injectScriptTag } from './client-bundle';
 import * as log from './logger';
 import { RisuSaveType, toRisuSaveType, type HydrationState } from '../shared/types';
+import { getUsePlainFetch, setUsePlainFetch } from './proxy-config-state';
 
 // --- Route classification ---
 
@@ -41,6 +42,7 @@ type Route =
   | { type: 'db-char-detail'; charId: string }
   | { type: 'db-char-details' }
   | { type: 'db-batch-remotes' }
+  | { type: 'proxy-config' }
   | { type: 'root-html' }
   | { type: 'list-files' }
   | { type: 'passthrough' };
@@ -81,6 +83,11 @@ function classifyRequest(req: http.IncomingMessage): Route {
   const charDetailMatch = url.match(CHAR_DETAIL_RE);
   if (charDetailMatch && req.method === 'GET') {
     return { type: 'db-char-detail', charId: charDetailMatch[1] };
+  }
+
+  // Proxy config (chaining endpoint)
+  if (url === '/.proxy/config' && req.method === 'GET') {
+    return { type: 'proxy-config' };
   }
 
   // proxy2
@@ -233,6 +240,9 @@ function captureDatabaseBin(body: Buffer, authHeader: string | undefined): void 
           expectedRemoteCount++;
           charIds.push(ptr.charId);
         }
+      }
+      if (block.type === RisuSaveType.ROOT) {
+        extractUsePlainFetch(block.data);
       }
     }
   });
@@ -439,6 +449,78 @@ function handleRootHtml(req: http.IncomingMessage, res: http.ServerResponse): vo
   });
 }
 
+// --- usePlainFetch extraction ---
+
+function extractUsePlainFetch(rootBlockData: Buffer): void {
+  try {
+    const parsed: Record<string, unknown> = JSON.parse(rootBlockData.toString('utf-8'));
+    if (typeof parsed.usePlainFetch === 'boolean') {
+      setUsePlainFetch(parsed.usePlainFetch);
+    }
+  } catch {
+    // ROOT block parse failure — ignore, usePlainFetch stays unknown
+  }
+}
+
+// --- Proxy config handler ---
+
+function handleProxyConfig(req: http.IncomingMessage, res: http.ServerResponse): void {
+  const proxyReq = http.request(
+    {
+      hostname: UPSTREAM.hostname,
+      port: UPSTREAM.port,
+      path: '/.proxy/config',
+      method: 'GET',
+      headers: { ...req.headers, host: UPSTREAM.host },
+    },
+    (proxyRes) => {
+      const chunks: Buffer[] = [];
+      proxyRes.on('data', (chunk: Buffer) => chunks.push(chunk));
+      proxyRes.on('end', () => {
+        let upstream: Record<string, unknown> = {};
+        if (proxyRes.statusCode === 200) {
+          try {
+            const parsed: Record<string, unknown> = JSON.parse(Buffer.concat(chunks).toString('utf-8'));
+            if (typeof parsed === 'object' && parsed !== null) {
+              upstream = parsed;
+            }
+          } catch { /* start fresh */ }
+        }
+
+        upstream['withSqlite'] = {
+          hydrationState,
+          usePlainFetch: getUsePlainFetch(),
+        };
+
+        const body = JSON.stringify(upstream);
+        res.writeHead(200, {
+          'content-type': 'application/json',
+          'content-length': String(Buffer.byteLength(body)),
+          'cache-control': 'no-cache',
+        });
+        res.end(body);
+      });
+    },
+  );
+
+  proxyReq.on('error', () => {
+    const body = JSON.stringify({
+      withSqlite: {
+        hydrationState,
+        usePlainFetch: getUsePlainFetch(),
+      },
+    });
+    res.writeHead(200, {
+      'content-type': 'application/json',
+      'content-length': String(Buffer.byteLength(body)),
+      'cache-control': 'no-cache',
+    });
+    res.end(body);
+  });
+
+  proxyReq.end();
+}
+
 // --- Server ---
 
 const cb = createCircuitBreaker();
@@ -609,6 +691,12 @@ function main(): void {
           'cache-control': 'no-cache',
         });
         res.end(buf);
+        return;
+      }
+
+      // --- Proxy config ---
+      case 'proxy-config': {
+        handleProxyConfig(req, res);
         return;
       }
 

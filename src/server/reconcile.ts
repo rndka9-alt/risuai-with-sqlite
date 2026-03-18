@@ -6,6 +6,7 @@ import { slimCharacter, deepSlimCharacter } from './slim';
 import { compressColdStorage } from './cold-compat';
 import { writeToUpstream } from './proxy';
 import { RisuSaveType } from '../shared/types';
+import { setUsePlainFetch } from './proxy-config-state';
 import * as log from './logger';
 
 /**
@@ -43,6 +44,18 @@ export function reconcileDatabaseBin(
           block.hash,
         );
         driftCount++;
+      }
+
+      // Update usePlainFetch from ROOT block (always, regardless of drift)
+      if (block.type === RisuSaveType.ROOT) {
+        try {
+          const parsed: Record<string, unknown> = JSON.parse(block.data.toString('utf-8'));
+          if (typeof parsed.usePlainFetch === 'boolean') {
+            setUsePlainFetch(parsed.usePlainFetch);
+          }
+        } catch {
+          // ignore parse failure
+        }
       }
     }
   });

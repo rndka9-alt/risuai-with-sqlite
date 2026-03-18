@@ -195,6 +195,24 @@ RisuAI HTML에 `<script defer src="/db/client.js">` 를 자동 주입한다.
 | `/db/jobs/{id}/abort` | POST | 스트리밍 중단 |
 | `/db/jobs/{id}/consume` | POST | job 삭제 |
 | `/proxy2` | POST | LLM 스트리밍 프록시 (SSE 버퍼링 + job 관리) |
+| `/.proxy/config` | GET | 프록시 체이닝 설정 (usePlainFetch 등 런타임 상태, downstream 병합) |
+
+### `/.proxy/config` 체이닝 엔드포인트
+
+`/.proxy/*` 경로는 프록시 체인 전체가 공유하는 네임스페이스다.
+각 프록시 서버가 요청을 downstream으로 전달한 뒤, 응답에 자기 데이터를 merge하여 반환한다.
+
+```
+Client → sync → with-sqlite → risuai (404)
+                                 ↓
+                    { withSqlite: { ... } }   ← with-sqlite가 생성
+               ↓
+  { sync: { ... }, withSqlite: { ... } }      ← sync가 merge
+```
+
+- downstream이 404를 반환하면 `{}`에서 시작하고, 200이면 기존 JSON에 자기 키를 추가한다.
+- 프록시 수에 무관하게 클라이언트는 단일 요청으로 전체 프록시 상태를 받는다.
+- 새로운 프록시를 체인에 추가할 때 동일 패턴으로 자기 키만 merge하면 된다.
 
 ## DB 스키마
 
