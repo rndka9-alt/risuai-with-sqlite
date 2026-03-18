@@ -136,15 +136,18 @@ const pendingBatchRequests: Array<{ res: http.ServerResponse; timer: ReturnType<
 
 const BATCH_WAIT_TIMEOUT_MS = 30_000;
 
-function checkHydrationComplete(): void {
-  if (hydrationState === 'HOT') return;
-  if (hydrationState === 'COLD') return;
+/**
+ * If all expected remotes have been captured, transition to HOT and flush
+ * pending batch requests. Returns the resolved hydration state so callers
+ * can branch without relying on side-effect mutation.
+ */
+function resolveHydration(): HydrationState {
+  if (hydrationState !== 'WARMING') return hydrationState;
+  if (capturedRemotes.size < expectedRemoteCount) return hydrationState;
 
-  if (capturedRemotes.size >= expectedRemoteCount) {
-    hydrationState = 'HOT';
-    log.info(`Hydration complete. State: HOT`, { remotesCached: capturedRemotes.size });
-    flushPendingBatchRequests();
-  }
+  log.info('Hydration complete. State: HOT', { remotesCached: capturedRemotes.size });
+  flushPendingBatchRequests();
+  return 'HOT';
 }
 
 function flushPendingBatchRequests(): void {
@@ -239,7 +242,7 @@ function captureDatabaseBin(body: Buffer, authHeader: string | undefined): void 
     blocks: result.blocks.length,
     remotesExpected: expectedRemoteCount,
   });
-  checkHydrationComplete();
+  hydrationState = resolveHydration();
 
   // Proactively fetch all remotes from upstream (non-blocking)
   if (hydrationState !== 'HOT' && charIds.length > 0) {
@@ -301,7 +304,7 @@ async function captureRemoteFile(body: Buffer, charId: string, authHeader: strin
     total: (t4 - t0).toFixed(0) + 'ms',
     captured: capturedRemotes.size + '/' + expectedRemoteCount,
   });
-  checkHydrationComplete();
+  hydrationState = resolveHydration();
 }
 
 // --- Read handlers ---
