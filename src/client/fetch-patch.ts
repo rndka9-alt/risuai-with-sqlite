@@ -6,18 +6,7 @@
  */
 
 import { tryServeBatchRemote } from './batch-remotes';
-
-declare const __pluginApis__: {
-  getDatabase(): {
-    characters: Array<{
-      chaId: string;
-      chatPage?: number;
-      chats?: Array<{
-        message?: Array<{ time?: number }>;
-      }>;
-    }>;
-  };
-} | undefined;
+import { getPluginApis } from '../utils/getPluginApis';
 
 /** Track the most recent job ID from proxy2 responses */
 export let lastJobId: string | null = null;
@@ -28,8 +17,7 @@ export let lastJobId: string | null = null;
  */
 function findStreamTarget(): string | null {
   try {
-    if (typeof __pluginApis__ === 'undefined') return null;
-    const db = __pluginApis__?.getDatabase();
+    const db = getPluginApis()?.getDatabase();
     if (!db?.characters) return null;
 
     let bestCharId: string | null = null;

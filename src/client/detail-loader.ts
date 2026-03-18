@@ -14,16 +14,7 @@
  * 5. Dismiss overlay
  */
 
-declare const __pluginApis__: {
-  getDatabase(): {
-    characters: Array<{
-      chaId: string;
-      reloadKeys?: number;
-      __strippedFields?: string[];
-      [key: string]: any;
-    }>;
-  };
-} | undefined;
+import { getPluginApis } from '../utils/getPluginApis';
 
 interface DetailMap {
   [charId: string]: Record<string, any>;
@@ -114,8 +105,7 @@ function mergeDetail(char: any, detail: Record<string, any>): void {
 
 /** Returns true if stripped fields were found and loading was needed. */
 async function loadAllDetails(): Promise<boolean> {
-  if (typeof __pluginApis__ === 'undefined') return false;
-  const db = __pluginApis__?.getDatabase();
+  const db = getPluginApis()?.getDatabase();
   if (!db?.characters) return false;
 
   // No stripped fields → proxy is in COLD state or no deep-slim applied
@@ -151,7 +141,7 @@ function waitForApiAndLoad(): void {
   const check = () => {
     attempts++;
 
-    if (typeof __pluginApis__ !== 'undefined' && __pluginApis__?.getDatabase()?.characters) {
+    if (getPluginApis()?.getDatabase()?.characters) {
       let failsafe: ReturnType<typeof setTimeout> | undefined;
       loadAllDetails()
         .then((needed) => {

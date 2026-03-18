@@ -4,20 +4,7 @@
  */
 
 import { showNotification } from './notification';
-
-declare const __pluginApis__: {
-  getDatabase(): {
-    characters: Array<{
-      chaId: string;
-      chatPage?: number;
-      reloadKeys?: number;
-      chats?: Array<{
-        message?: Array<{ role: string; data: string; time?: number; saying?: string }>;
-        isStreaming?: boolean;
-      }>;
-    }>;
-  };
-} | undefined;
+import { getPluginApis } from '../utils/getPluginApis';
 
 interface Job {
   id: string;
@@ -34,8 +21,7 @@ function resolveTarget(charId: string): {
   charIndex: number;
   chatIndex: number;
 } | null {
-  if (typeof __pluginApis__ === 'undefined') return null;
-  const db = __pluginApis__?.getDatabase();
+  const db = getPluginApis()?.getDatabase();
   if (!db?.characters) return null;
 
   const charIndex = db.characters.findIndex((c) => c && c.chaId === charId);
@@ -55,8 +41,7 @@ function applyCompletedJob(job: Job): boolean {
   const target = resolveTarget(job.charId);
   if (!target) return false;
 
-  if (typeof __pluginApis__ === 'undefined') return false;
-  const db = __pluginApis__?.getDatabase();
+  const db = getPluginApis()?.getDatabase();
   if (!db) return false;
 
   const char = db.characters[target.charIndex];
@@ -93,8 +78,7 @@ function reconnectToStream(job: Job): void {
   const target = resolveTarget(job.charId);
   if (!target) return;
 
-  if (typeof __pluginApis__ === 'undefined') return;
-  const db = __pluginApis__?.getDatabase();
+  const db = getPluginApis()?.getDatabase();
   if (!db) return;
 
   const char = db.characters[target.charIndex];
