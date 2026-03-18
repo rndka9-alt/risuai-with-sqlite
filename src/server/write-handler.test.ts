@@ -355,7 +355,7 @@ describe('handleWriteRemote', () => {
     expect(getChatsByCharId(db, 'char-1')).toHaveLength(0);
   });
 
-  it('exits early when character has no chats array', async () => {
+  it('stores deep-slimmed character even when no chats array', async () => {
     const character = { name: 'Bob', chaId: 'char-1', desc: 'minimal' };
     const body = Buffer.from(JSON.stringify(character), 'utf-8');
     vi.mocked(bufferBody).mockResolvedValue(body);
@@ -364,9 +364,18 @@ describe('handleWriteRemote', () => {
 
     expect(forwardBuffered).toHaveBeenCalled();
 
-    // Background exits at !Array.isArray(character.chats) — nothing stored
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    expect(getBlock(db, 'remote:char-1')).toBeUndefined();
+    // slimCharacter handles no-chats gracefully → pipeline continues with deep slim + DB
+    await vi.waitFor(() => {
+      expect(getBlock(db, 'remote:char-1')).toBeDefined();
+    });
+
+    // No cold entries created
+    expect(getChatsByCharId(db, 'char-1')).toHaveLength(0);
+    // But character is still stored (deep-slimmed)
+    const block = getBlock(db, 'remote:char-1');
+    const stored = JSON.parse(block!.data.toString('utf-8'));
+    expect(stored.name).toBe('Bob');
+    expect(stored.desc).toBe(''); // heavy field stripped
   });
 
   it('creates cold entries for multiple chats', async () => {

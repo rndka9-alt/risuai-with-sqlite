@@ -263,7 +263,13 @@ async function captureRemoteFile(body: Buffer, charId: string, authHeader: strin
   const { slimJson: chatSlimJson, coldEntries } = await slimCharacter(charJson, charId);
   const t2 = performance.now();
 
-  // Phase 2: strip heavy fields → char_details
+  // Phase 2: deep slim → compress → DB → upstream write
+  //
+  // This pipeline is intentionally duplicated with handleWriteRemote() in write-handler.ts.
+  // Both load character data into the SQLite cache, but in different contexts:
+  //   - here: proactive hydration from upstream (awaited, owns db access, tracks hydration state)
+  //   - handleWriteRemote: background processing after a client write-through (setImmediate, db passed in, error-logged)
+  // Merging would couple the hydration lifecycle to the write path.
   const { slimJson: deepSlimJson, detailJson } = deepSlimCharacter(chatSlimJson);
   const deepSlimBuffer = Buffer.from(deepSlimJson, 'utf-8');
   const detailCompressed = await compressColdStorage(detailJson);

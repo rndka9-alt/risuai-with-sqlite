@@ -4,7 +4,7 @@ import Database from 'better-sqlite3';
 import { RISU_AUTH_HEADER } from './config';
 import { bufferBody, forwardBuffered, writeToUpstream } from './proxy';
 import { parseRisuSave, parseRemoteFile } from './parser';
-import { slimCharacter, deepSlimCharacter, mergeCharacterDetail, isColdMarker, COLD_STORAGE_HEADER } from './slim';
+import { slimCharacter, deepSlimCharacter, mergeCharacterDetail } from './slim';
 import { compressColdStorage, decompressColdStorage } from './cold-compat';
 import { upsertBlock, upsertChat, upsertCharDetail, getCharDetail, inTransaction } from './db';
 import { RisuSaveType } from '../shared/types';
@@ -104,70 +104,23 @@ export async function handleWriteRemote(
       if (!block) return;
 
       const charJson = block.data.toString('utf-8');
-      let character: Record<string, unknown>;
-      try {
-        character = JSON.parse(charJson);
-      } catch {
-        return;
-      }
 
-      if (!Array.isArray(character.chats)) return;
+      // Phase 1: slim chats → cold markers
+      const { slimJson: chatSlimJson, coldEntries } = await slimCharacter(charJson, charId);
 
-      const chats = character.chats;
-      const tasks: Array<{
-        chatIndex: number;
-        uuid: string;
-        coldPayload: string;
-      }> = [];
-
-      // Collect chats that need cold storage
-      for (let i = 0; i < chats.length; i++) {
-        const chat = chats[i];
-
-        if (isColdMarker(chat)) continue;
-        if (!Array.isArray(chat.message) || chat.message.length === 0) continue;
-
-        const uuid = crypto.randomUUID();
-        const coldPayload = JSON.stringify({
-          message: chat.message,
-          hypaV2Data: chat.hypaV2Data,
-          hypaV3Data: chat.hypaV3Data,
-          scriptstate: chat.scriptstate,
-          localLore: chat.localLore,
-        });
-
-        tasks.push({ chatIndex: i, uuid, coldPayload });
-
-        // Replace chat with marker for slim version
-        chat.message = [
-          { role: 'char', data: COLD_STORAGE_HEADER + uuid, time: Date.now() },
-        ];
-        chat.hypaV2Data = { chunks: [], mainChunks: [], lastMainChunkID: 0 };
-        chat.hypaV3Data = { summaries: [] };
-        chat.scriptstate = {};
-        chat.localLore = [];
-      }
-
-      // Compress all chats in parallel (runs on libuv worker threads)
-      const newColdEntries = await Promise.all(
-        tasks.map(async (task) => {
-          const compressed = await compressColdStorage(task.coldPayload);
-          const hash = crypto.createHash('sha256').update(task.coldPayload).digest('hex');
-          return { uuid: task.uuid, charId, chatIndex: task.chatIndex, compressed, hash };
-        }),
-      );
-
-      // Phase 1: chat-slimmed JSON
-      const chatSlimJson = JSON.stringify(character);
-
-      // Phase 2: deep slim (strip heavy fields)
+      // Phase 2: deep slim → compress → DB → upstream write
+      //
+      // This pipeline is intentionally duplicated with captureRemoteFile() in index.ts.
+      // Both load character data into the SQLite cache, but in different contexts:
+      //   - here: background processing after a client write-through (setImmediate, db passed in, error-logged)
+      //   - captureRemoteFile: proactive hydration from upstream (awaited, owns db access, tracks hydration state)
+      // Merging would couple the write path to the hydration lifecycle.
       const { slimJson: deepSlimJson, detailJson } = deepSlimCharacter(chatSlimJson);
       const deepSlimBuffer = Buffer.from(deepSlimJson, 'utf-8');
       const detailCompressed = await compressColdStorage(detailJson);
       const detailHash = crypto.createHash('sha256').update(detailJson).digest('hex');
 
       inTransaction(db, () => {
-        // Update deep-slim character data
         upsertBlock(
           db,
           `remote:${charId}`,
@@ -177,18 +130,13 @@ export async function handleWriteRemote(
           deepSlimBuffer,
           block.hash,
         );
-
-        // Store detail fields
         upsertCharDetail(db, charId, detailCompressed, detailHash);
-
-        // Store new cold entries
-        for (const entry of newColdEntries) {
+        for (const entry of coldEntries) {
           upsertChat(db, entry.uuid, entry.charId, entry.chatIndex, entry.compressed, entry.hash);
         }
       });
 
-      // Write cold entries to upstream for FS consistency (fire-and-forget)
-      for (const entry of newColdEntries) {
+      for (const entry of coldEntries) {
         writeToUpstream(`coldstorage/${entry.uuid}`, entry.compressed, authHeader);
       }
     } catch (err) {
