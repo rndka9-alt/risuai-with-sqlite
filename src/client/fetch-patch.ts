@@ -6,6 +6,7 @@
  */
 
 import { tryServeBatchRemote } from './batch-remotes';
+import { tryServeFileList, onFileWrite, onFileRemove } from './file-list-dataset';
 import { getPluginApis } from '../utils/getPluginApis';
 
 /** Track the most recent job ID from proxy2 responses */
@@ -59,6 +60,14 @@ function getHeader(headers: HeadersInit | undefined, key: string): string | null
 // hex-encoded prefix for "remotes/"
 const REMOTES_HEX_PREFIX = '72656d6f7465732f';
 
+function hexToUtf8(hex: string): string {
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < hex.length; i += 2) {
+    bytes[i / 2] = parseInt(hex.substring(i, i + 2), 16);
+  }
+  return new TextDecoder().decode(bytes);
+}
+
 function setHeader(headers: HeadersInit, key: string, value: string): void {
   if (headers instanceof Headers) {
     headers.set(key, value);
@@ -91,6 +100,16 @@ const patchedFetch: typeof fetch = function (input, init) {
     });
   }
 
+  // Intercept GET /api/list → serve from file-list dataset
+  if (input === '/api/list' && (!init?.method || init.method === 'GET')) {
+    const cached = tryServeFileList();
+    if (cached) {
+      return cached.then((resp) =>
+        resp ?? originalFetch.call(window, input, init!)
+      );
+    }
+  }
+
   // Intercept GET /api/read for remote files → serve from batch cache
   if (input === '/api/read' && (!init?.method || init.method === 'GET')) {
     const filePath = getHeader(init?.headers, 'file-path');
@@ -101,6 +120,27 @@ const patchedFetch: typeof fetch = function (input, init) {
           resp ?? originalFetch.call(window, input, init!)
         );
       }
+    }
+  }
+
+  // Track write/remove to keep file-list dataset in sync
+  if (input === '/api/write' && init?.method === 'POST') {
+    const filePath = getHeader(init?.headers, 'file-path');
+    if (filePath) {
+      return originalFetch.call(window, input, init!).then((resp) => {
+        if (resp.ok) onFileWrite(hexToUtf8(filePath));
+        return resp;
+      });
+    }
+  }
+
+  if (input === '/api/remove' && (!init?.method || init.method === 'GET')) {
+    const filePath = getHeader(init?.headers, 'file-path');
+    if (filePath) {
+      return originalFetch.call(window, input, init!).then((resp) => {
+        if (resp.ok) onFileRemove(hexToUtf8(filePath));
+        return resp;
+      });
     }
   }
 

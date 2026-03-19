@@ -43,6 +43,7 @@ type Route =
   | { type: 'db-char-detail'; charId: string }
   | { type: 'db-char-details' }
   | { type: 'db-batch-remotes' }
+  | { type: 'db-file-list-dataset' }
   | { type: 'proxy-config' }
   | { type: 'root-html' }
   | { type: 'list-files' }
@@ -71,6 +72,11 @@ function classifyRequest(req: http.IncomingMessage): Route {
   const consumeMatch = url.match(JOB_CONSUME_RE);
   if (consumeMatch && req.method === 'POST') {
     return { type: 'db-job-consume', jobId: consumeMatch[1] };
+  }
+
+  // File list dataset endpoint
+  if (url === '/db/file-list-dataset' && req.method === 'GET') {
+    return { type: 'db-file-list-dataset' };
   }
 
   // Batch remotes endpoint
@@ -656,6 +662,24 @@ function main(): void {
           return;
         }
         handleGetAllCharDetails(req, res);
+        return;
+      }
+
+      case 'db-file-list-dataset': {
+        if (!isDbReady() || !isFileListCacheReady(getDb())) {
+          res.writeHead(204);
+          res.end();
+          return;
+        }
+        const files = getFileListCache(getDb());
+        const filtered = files.filter((f) => !f.includes('.meta.meta'));
+        const payload = JSON.stringify({ files: filtered, timestamp: Date.now() });
+        res.writeHead(200, {
+          'content-type': 'application/json',
+          'content-length': String(Buffer.byteLength(payload)),
+          'cache-control': 'no-cache',
+        });
+        res.end(payload);
         return;
       }
 
