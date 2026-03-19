@@ -18,6 +18,7 @@ import * as log from './logger';
 import { RisuSaveType, toRisuSaveType, type HydrationState } from '../shared/types';
 import { getUsePlainFetch, setUsePlainFetch } from './proxy-config-state';
 import { initAuth, isAuthReady, issueInternalToken, verifyClientAuth } from './auth';
+import { startPeriodicSync } from './periodic-sync';
 
 // --- Route classification ---
 
@@ -1046,6 +1047,9 @@ function main(): void {
       if (dbBody && dbBody.length > 0) {
         captureDatabaseBin(dbBody, token);
       }
+
+      // Start periodic sync (24h interval)
+      startPeriodicSync(getDb);
     })();
   });
 }
