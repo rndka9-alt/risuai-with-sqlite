@@ -50,11 +50,10 @@ function getHeader(headers: HeadersInit | undefined, key: string): string | null
     const entry = headers.find(([k]) => k.toLowerCase() === key.toLowerCase());
     return entry ? entry[1] : null;
   }
-  const record = headers as Record<string, string>;
-  for (const k of Object.keys(record)) {
-    if (k.toLowerCase() === key.toLowerCase()) return record[k];
-  }
-  return null;
+  // Remaining case: Record<string, string>
+  const entries = Object.entries(headers);
+  const match = entries.find(([k]) => k.toLowerCase() === key.toLowerCase());
+  return match ? match[1] : null;
 }
 
 // hex-encoded prefix for "remotes/"
@@ -105,7 +104,7 @@ const patchedFetch: typeof fetch = function (input, init) {
     const cached = tryServeFileList();
     if (cached) {
       return cached.then((resp) =>
-        resp ?? originalFetch.call(window, input, init!)
+        resp ?? originalFetch.call(window, input, init)
       );
     }
   }
@@ -125,7 +124,7 @@ const patchedFetch: typeof fetch = function (input, init) {
       const cached = tryServeBatchRemote(filePath);
       if (cached) {
         return cached.then((resp) =>
-          resp ?? originalFetch.call(window, input, init!)
+          resp ?? originalFetch.call(window, input, init)
         );
       }
     }
@@ -135,7 +134,7 @@ const patchedFetch: typeof fetch = function (input, init) {
   if (input === '/api/write' && init?.method === 'POST') {
     const filePath = getHeader(init?.headers, 'file-path');
     if (filePath) {
-      return originalFetch.call(window, input, init!).then((resp) => {
+      return originalFetch.call(window, input, init).then((resp) => {
         if (resp.ok) onFileWrite(hexToUtf8(filePath));
         return resp;
       });
@@ -145,14 +144,14 @@ const patchedFetch: typeof fetch = function (input, init) {
   if (input === '/api/remove' && (!init?.method || init.method === 'GET')) {
     const filePath = getHeader(init?.headers, 'file-path');
     if (filePath) {
-      return originalFetch.call(window, input, init!).then((resp) => {
+      return originalFetch.call(window, input, init).then((resp) => {
         if (resp.ok) onFileRemove(hexToUtf8(filePath));
         return resp;
       });
     }
   }
 
-  return originalFetch.call(window, input, init!);
+  return originalFetch.call(window, input, init);
 };
 
 export function install(): void {

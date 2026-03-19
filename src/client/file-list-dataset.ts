@@ -54,13 +54,13 @@ export function tryServeFileList(): Promise<Response | null> | null {
   // Dataset already loaded
   if (dataset) {
     if (!isFresh()) return null;
-    return Promise.resolve(buildResponse());
+    return Promise.resolve(buildResponse(dataset));
   }
 
   // Dataset fetch still in-flight — wait for it
   if (datasetPromise) {
     return datasetPromise.then(() => {
-      if (dataset && isFresh()) return buildResponse();
+      if (dataset && isFresh()) return buildResponse(dataset);
       return null;
     });
   }
@@ -103,8 +103,8 @@ export function tryServeMetaRead(filePath: string): Response | null {
   });
 }
 
-function buildResponse(): Response {
-  const body = JSON.stringify({ content: dataset!.files });
+function buildResponse(ds: FileListDataset): Response {
+  const body = JSON.stringify({ content: ds.files });
   return new Response(body, {
     status: 200,
     headers: { 'content-type': 'application/json' },

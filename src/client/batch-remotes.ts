@@ -75,7 +75,7 @@ export function installBatchRemotes(): void {
  * Returns a Promise<Response> if the batch can handle this request,
  * or null if it should fall through to the original fetch.
  */
-export function tryServeBatchRemote(hexFilePath: string): Promise<Response> | null {
+export function tryServeBatchRemote(hexFilePath: string): Promise<Response | null> | null {
   if (batchFailed) return null;
 
   // Batch already loaded
@@ -104,7 +104,7 @@ export function tryServeBatchRemote(hexFilePath: string): Promise<Response> | nu
         });
       }
       return null;
-    }) as Promise<Response>;
+    });
   }
 
   return null;
