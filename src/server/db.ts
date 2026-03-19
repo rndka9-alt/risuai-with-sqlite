@@ -100,12 +100,6 @@ export function initDb(): Database.Database {
     );
   `);
 
-  // Migration: add last_used column for DBs created before this column existed
-  const columns = db.pragma('table_info(file_list_cache)') as Array<{ name: string }>;
-  if (!columns.some((c) => c.name === 'last_used')) {
-    db.exec('ALTER TABLE file_list_cache ADD COLUMN last_used INTEGER');
-  }
-
   _db = db;
   return db;
 }

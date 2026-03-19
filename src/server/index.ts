@@ -19,6 +19,7 @@ import { RisuSaveType, toRisuSaveType, type HydrationState } from '../shared/typ
 import { getUsePlainFetch, extractUsePlainFetch } from './proxy-config-state';
 import { initAuth, isAuthReady, issueInternalToken, verifyClientAuth } from './auth';
 import { startPeriodicSync } from './periodic-sync';
+import { dbMigrate } from './dbMigrate';
 
 // --- Route classification ---
 
@@ -546,6 +547,7 @@ const cb = createCircuitBreaker();
 function main(): void {
   try {
     const db = initDb();
+    dbMigrate(db);
     resetDb(db);
     log.info('SQLite initialized (fresh start)');
   } catch (err) {
