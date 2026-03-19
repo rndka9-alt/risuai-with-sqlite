@@ -1,6 +1,14 @@
+// --- Required env validation ---
+
+if (!process.env.UPSTREAM) {
+  throw new Error('UPSTREAM env is required (e.g. http://risuai:6001)');
+}
+
+const RISUAI_SAVE_MOUNT = '/risuai-save';
+
 export const PORT = parseInt(process.env.PORT || '3001', 10);
 
-const upstreamRaw = process.env.UPSTREAM || 'http://localhost:6001';
+const upstreamRaw = process.env.UPSTREAM;
 export const UPSTREAM_URL = new URL(upstreamRaw);
 export const UPSTREAM = {
   hostname: UPSTREAM_URL.hostname,
@@ -23,6 +31,9 @@ export const REQUEST_ID_HEADER = 'x-request-id';
 export const RISU_AUTH_HEADER = 'risu-auth';
 export const DBPROXY_TARGET_HEADER = 'x-dbproxy-target-char';
 export const DBPROXY_JOB_ID_HEADER = 'x-dbproxy-job-id';
+
+// RisuAI save mount
+export { RISUAI_SAVE_MOUNT };
 
 // Circuit breaker
 export const CB_FAILURE_THRESHOLD = parseInt(

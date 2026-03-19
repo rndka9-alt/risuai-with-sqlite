@@ -254,16 +254,20 @@ export function forwardBufferAndTransform(
   });
 }
 
-/** Fetch a file from upstream by path. Returns the response body or null on error. */
+/** Fetch from upstream. Defaults to GET /api/read with file-path header.
+ *  Pass overridePath (e.g. '/api/list') to hit a different endpoint. */
 export function fetchFromUpstream(
   filePath: string,
   authHeader: string | undefined,
+  overridePath?: string,
 ): Promise<Buffer | null> {
   return new Promise((resolve) => {
     const headers: Record<string, string> = {
       host: UPSTREAM.host,
-      [FILE_PATH_HEADER]: encodeFilePath(filePath),
     };
+    if (filePath) {
+      headers[FILE_PATH_HEADER] = encodeFilePath(filePath);
+    }
     if (authHeader) {
       headers[RISU_AUTH_HEADER] = authHeader;
     }
@@ -272,7 +276,7 @@ export function fetchFromUpstream(
       {
         hostname: UPSTREAM.hostname,
         port: UPSTREAM.port,
-        path: '/api/read',
+        path: overridePath || '/api/read',
         method: 'GET',
         headers,
       },

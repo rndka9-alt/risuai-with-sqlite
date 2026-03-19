@@ -17,6 +17,7 @@ import { getClientJs, injectScriptTag } from './client-bundle';
 import * as log from './logger';
 import { RisuSaveType, toRisuSaveType, type HydrationState } from '../shared/types';
 import { getUsePlainFetch, setUsePlainFetch } from './proxy-config-state';
+import { initAuth, isAuthReady, issueInternalToken, verifyClientAuth } from './auth';
 
 // --- Route classification ---
 
@@ -595,6 +596,32 @@ function main(): void {
       }
     });
 
+    // --- Auth check for /db/* data endpoints ---
+    if (route.type.startsWith('db-') && route.type !== 'db-client-js') {
+      const clientAuth = typeof req.headers[RISU_AUTH_HEADER] === 'string'
+        ? req.headers[RISU_AUTH_HEADER] : null;
+      if (!clientAuth) {
+        res.writeHead(401, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'No auth header' }));
+        return;
+      }
+      verifyClientAuth(clientAuth).then((valid) => {
+        if (!valid) {
+          res.writeHead(401, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Unauthorized' }));
+          return;
+        }
+        handleRoute();
+      }).catch(() => {
+        // Auth check failed — fall through to serve anyway (P1: availability)
+        handleRoute();
+      });
+      return;
+    }
+
+    handleRoute();
+
+    function handleRoute(): void {
     switch (route.type) {
       // --- DB Proxy endpoints ---
       case 'db-client-js': {
@@ -964,6 +991,7 @@ function main(): void {
         forwardRequest(req, res);
         return;
     }
+    } // handleRoute
   });
 
   server.listen(PORT, () => {
@@ -973,6 +1001,46 @@ function main(): void {
       hydration: hydrationState,
       streamBuffer: 'enabled',
     });
+
+    // Self-auth → proactive hydration (non-blocking)
+    initAuth()
+      .then(async () => {
+        if (!isAuthReady() || !isDbReady()) return;
+        const token = await issueInternalToken();
+        if (!token) return;
+
+        // Hydrate file list cache
+        const listBody = await fetchFromUpstream('', token, '/api/list');
+        if (listBody && listBody.length > 0) {
+          try {
+            const data: { content?: string[] } = JSON.parse(listBody.toString('utf-8'));
+            if (data.content && Array.isArray(data.content)) {
+              populateFileListCache(getDb(), data.content);
+              log.info('Proactive file_list_cache hydration complete', { entries: data.content.length });
+            }
+          } catch (e) {
+            log.warn('Proactive file list hydration parse error', { error: String(e) });
+          }
+        }
+
+        // Hydrate .meta lastUsed
+        const missing = getMetaMissingLastUsed(getDb());
+        if (missing.length > 0) {
+          await Promise.all(missing.map(async (metaPath) => {
+            try {
+              const body = await fetchFromUpstream(metaPath, token);
+              if (body && body.length > 0) {
+                const parsed: { lastUsed?: number } = JSON.parse(body.toString('utf-8'));
+                if (typeof parsed.lastUsed === 'number') {
+                  upsertMetaLastUsed(getDb(), metaPath, parsed.lastUsed);
+                }
+              }
+            } catch { /* skip */ }
+          }));
+          log.info('Proactive .meta hydration complete', { count: missing.length });
+        }
+      })
+      .catch((e) => log.warn('Proactive hydration error', { error: String(e) }));
   });
 }
 

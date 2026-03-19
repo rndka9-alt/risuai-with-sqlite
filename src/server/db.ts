@@ -123,7 +123,6 @@ export function resetDb(db: Database.Database): void {
     DELETE FROM chats;
     DELETE FROM char_details;
     DELETE FROM jobs;
-    DELETE FROM file_list_cache;
   `);
 }
 
