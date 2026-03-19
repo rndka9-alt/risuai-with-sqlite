@@ -341,12 +341,13 @@ src/
 │   ├── config.ts             # 환경변수 로딩 + 필수값 검증
 │   ├── auth.ts               # Self-auth (ES256 키페어 + risuai 로그인 + JWT 발급 + 클라이언트 인증 위임)
 │   ├── proxy.ts              # upstream forward (bypass의 기본 동작)
+│   ├── proxy-config-state.ts # usePlainFetch 공유 상태 + ROOT 블록에서 추출
 │   ├── circuit-breaker.ts    # 실패 감지, bypass 모드 전환
-│   ├── db.ts                 # SQLite 연결, CRUD (blocks, chats, char_details, jobs)
+│   ├── db.ts                 # SQLite 연결, CRUD (blocks, chats, char_details, jobs, file_list_cache)
 │   ├── logger.ts             # 로그 레벨 관리 (debug/info/warn/error)
 │   ├── parser.ts             # RisuSave 바이너리 파싱
 │   ├── assembler.ts          # 블록 → RisuSave 바이너리 재조립
-│   ├── slim.ts               # Chat cold storage + Deep slim (29개 heavy fields 분리)
+│   ├── slim.ts               # Chat cold storage + Deep slim + slimRemote (공유 계산 파이프라인)
 │   ├── write-handler.ts      # Write 인터셉트 (__strippedFields merge + re-slim)
 │   ├── cold-compat.ts        # Cold storage 호환 (fflate 압축/해제)
 │   ├── reconcile.ts          # Passive FS↔DB 정합성 검사 (bypass 시 hash 비교)
@@ -355,9 +356,16 @@ src/
 │   ├── stream-buffer.ts      # /proxy2 SSE 스트리밍 + job 관리
 │   ├── client-bundle.ts      # client.js 로딩 + HTML script 주입
 │   ├── parser.test.ts        # parser 테스트
-│   └── slim.test.ts          # slim/deepSlim/merge 테스트
-└── shared/
-    └── types.ts              # RisuSaveType enum, ParsedBlock, Job 등 공유 타입
+│   ├── slim.test.ts          # slim/deepSlim/merge 테스트
+│   └── write-handler.test.ts # write handler 테스트
+├── shared/
+│   └── types.ts              # RisuSaveType enum, ParsedBlock, Job 등 공유 타입
+├── types/
+│   └── plugin-apis.ts        # RisuAI __pluginApis__ 타입 선언
+└── utils/
+    └── getPluginApis/        # __pluginApis__ 접근 래퍼 (클라이언트용)
+        ├── index.ts
+        └── getPluginApis.ts
 ```
 
 ## 설정
