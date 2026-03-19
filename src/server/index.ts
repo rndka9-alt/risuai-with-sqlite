@@ -10,6 +10,7 @@ import { slimCharacter, deepSlimCharacter } from './slim';
 import { compressColdStorage, decompressColdStorage } from './cold-compat';
 import { writeToUpstream } from './proxy';
 import { handleWriteDatabase, handleWriteRemote } from './write-handler';
+import { handleRemoveAsset } from './remove-handler';
 import { reconcileDatabaseBin, reconcileRemoteFile } from './reconcile';
 import { handleProxy2, handleGetActiveJobs, handleJobStream, handleJobAbort, handleJobConsume } from './stream-buffer';
 import { getClientJs, injectScriptTag } from './client-bundle';
@@ -45,6 +46,7 @@ type Route =
   | { type: 'proxy-config' }
   | { type: 'root-html' }
   | { type: 'list-files' }
+  | { type: 'remove-asset'; filePath: string }
   | { type: 'passthrough' };
 
 function classifyRequest(req: http.IncomingMessage): Route {
@@ -103,6 +105,14 @@ function classifyRequest(req: http.IncomingMessage): Route {
   // GET /api/list → .meta.meta 필터링
   if (url === '/api/list' && req.method === 'GET') {
     return { type: 'list-files' };
+  }
+
+  // GET /api/remove → asset protection
+  if (url === '/api/remove' && req.method === 'GET') {
+    const filePath = decodeFilePath(req);
+    if (filePath && filePath.startsWith('assets/')) {
+      return { type: 'remove-asset', filePath };
+    }
   }
 
   // File API routes
@@ -831,6 +841,15 @@ function main(): void {
             return null;
           }
         });
+        return;
+      }
+
+      case 'remove-asset': {
+        if (isDbReady()) {
+          handleRemoveAsset(req, res, route.filePath, getDb());
+          return;
+        }
+        forwardRequest(req, res);
         return;
       }
 

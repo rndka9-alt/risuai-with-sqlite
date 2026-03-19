@@ -3,10 +3,10 @@ import crypto from 'crypto';
 import Database from 'better-sqlite3';
 import { RISU_AUTH_HEADER } from './config';
 import { bufferBody, forwardBuffered, writeToUpstream } from './proxy';
-import { parseRisuSave, parseRemoteFile } from './parser';
+import { parseRisuSave, parseRemoteFile, parseRemotePointer } from './parser';
 import { slimCharacter, deepSlimCharacter, mergeCharacterDetail } from './slim';
 import { compressColdStorage, decompressColdStorage } from './cold-compat';
-import { upsertBlock, upsertChat, upsertCharDetail, getCharDetail, inTransaction } from './db';
+import { upsertBlock, upsertChat, upsertCharDetail, getCharDetail, purgeStaleCharDetails, inTransaction } from './db';
 import { RisuSaveType } from '../shared/types';
 import * as log from './logger';
 
@@ -35,6 +35,15 @@ export async function handleWriteDatabase(
       const result = parseRisuSave(body);
       if (!result) return;
 
+      // Extract active character IDs from REMOTE blocks
+      const activeCharIds = new Set<string>();
+      for (const block of result.blocks) {
+        if (block.type === RisuSaveType.REMOTE) {
+          const ptr = parseRemotePointer(block.data);
+          if (ptr) activeCharIds.add(ptr.charId);
+        }
+      }
+
       inTransaction(db, () => {
         for (const block of result.blocks) {
           upsertBlock(
@@ -46,6 +55,14 @@ export async function handleWriteDatabase(
             block.data,
             block.hash,
           );
+        }
+
+        // Purge char_details for deleted characters
+        if (activeCharIds.size > 0) {
+          const purged = purgeStaleCharDetails(db, activeCharIds);
+          if (purged.length > 0) {
+            log.info('Purged stale char_details', { charIds: purged });
+          }
         }
       });
     } catch (err) {

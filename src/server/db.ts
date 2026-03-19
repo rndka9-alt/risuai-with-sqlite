@@ -287,6 +287,44 @@ export function deleteCharDetail(db: Database.Database, charId: string): void {
   prep(db, 'DELETE FROM char_details WHERE char_id = ?').run(charId);
 }
 
+/**
+ * Delete char_details (and associated chats/blocks) for characters
+ * that no longer exist in the given active ID set.
+ * Returns the list of purged char IDs.
+ */
+export function purgeStaleCharDetails(
+  db: Database.Database,
+  activeCharIds: Set<string>,
+): string[] {
+  const allRows = prep<Pick<CharDetailRow, 'charId'>>(db,
+    'SELECT char_id as charId FROM char_details',
+  ).all();
+
+  const stale = allRows.filter((row) => !activeCharIds.has(row.charId));
+  if (stale.length === 0) return [];
+
+  for (const row of stale) {
+    prep(db, 'DELETE FROM char_details WHERE char_id = ?').run(row.charId);
+    prep(db, 'DELETE FROM chats WHERE char_id = ?').run(row.charId);
+    prep(db, 'DELETE FROM blocks WHERE name = ?').run(`remote:${row.charId}`);
+  }
+
+  return stale.map((row) => row.charId);
+}
+
+/**
+ * Check whether an asset path is referenced by any char_details entry.
+ * Performs a text search on compressed detail blobs — caller must
+ * decompress and pass the search function.
+ */
+export function getCharDetailBlobs(
+  db: Database.Database,
+): Array<{ charId: string; data: Buffer }> {
+  return prep<{ charId: string; data: Buffer }>(db,
+    'SELECT char_id as charId, data FROM char_details',
+  ).all();
+}
+
 // --- Job CRUD ---
 
 export function createJob(
