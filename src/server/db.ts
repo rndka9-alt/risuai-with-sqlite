@@ -92,6 +92,11 @@ export function initDb(): Database.Database {
       hash        TEXT NOT NULL,
       updated_at  INTEGER DEFAULT (unixepoch())
     );
+
+    CREATE TABLE IF NOT EXISTS file_list_cache (
+      path        TEXT PRIMARY KEY,
+      updated_at  INTEGER DEFAULT (unixepoch())
+    );
   `);
 
   _db = db;
@@ -117,6 +122,7 @@ export function resetDb(db: Database.Database): void {
     DELETE FROM chats;
     DELETE FROM char_details;
     DELETE FROM jobs;
+    DELETE FROM file_list_cache;
   `);
 }
 
@@ -323,6 +329,46 @@ export function getCharDetailBlobs(
   return prep<{ charId: string; data: Buffer }>(db,
     'SELECT char_id as charId, data FROM char_details',
   ).all();
+}
+
+// --- File List Cache ---
+
+export function populateFileListCache(
+  db: Database.Database,
+  paths: string[],
+): void {
+  const insert = db.prepare(
+    'INSERT OR IGNORE INTO file_list_cache (path, updated_at) VALUES (?, unixepoch())',
+  );
+  db.prepare('DELETE FROM file_list_cache').run();
+  for (const p of paths) {
+    insert.run(p);
+  }
+}
+
+export function getFileListCache(
+  db: Database.Database,
+): string[] {
+  return prep<{ path: string }>(db,
+    'SELECT path FROM file_list_cache ORDER BY path',
+  ).all().map((r) => r.path);
+}
+
+export function isFileListCacheReady(db: Database.Database): boolean {
+  const row = prep<{ cnt: number }>(db,
+    'SELECT COUNT(*) as cnt FROM file_list_cache',
+  ).get();
+  return (row?.cnt ?? 0) > 0;
+}
+
+export function addToFileListCache(db: Database.Database, path: string): void {
+  prep(db,
+    'INSERT OR IGNORE INTO file_list_cache (path, updated_at) VALUES (?, unixepoch())',
+  ).run(path);
+}
+
+export function removeFromFileListCache(db: Database.Database, path: string): void {
+  prep(db, 'DELETE FROM file_list_cache WHERE path = ?').run(path);
 }
 
 // --- Job CRUD ---

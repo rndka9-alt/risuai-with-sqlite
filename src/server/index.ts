@@ -3,7 +3,7 @@ import http from 'http';
 import { PORT, UPSTREAM, CLIENT_ID_HEADER, REQUEST_ID_HEADER, RISU_AUTH_HEADER, FILE_PATH_HEADER } from './config';
 import { forwardRequest, forwardAndTee, forwardBufferAndTransform, decodeFilePath, fetchFromUpstream } from './proxy';
 import { createCircuitBreaker } from './circuit-breaker';
-import { initDb, resetDb, isDbReady, getDb, getBlock, getBlocksBySource, getAllRemoteBlocks, upsertBlock, upsertChat, upsertCharDetail, getCharDetail, getAllCharDetails, getChat, inTransaction } from './db';
+import { initDb, resetDb, isDbReady, getDb, getBlock, getBlocksBySource, getAllRemoteBlocks, upsertBlock, upsertChat, upsertCharDetail, getCharDetail, getAllCharDetails, getChat, inTransaction, populateFileListCache, getFileListCache, isFileListCacheReady, addToFileListCache, removeFromFileListCache } from './db';
 import { parseRisuSave, parseRemoteFile, parseRemotePointer } from './parser';
 import { assembleRisuSave } from './assembler';
 import { slimCharacter, deepSlimCharacter } from './slim';
@@ -570,6 +570,19 @@ function main(): void {
         logFields.filePath = decodeFilePath(req) ?? rawFp;
       }
       log.info('Response', logFields);
+
+      // Sync file_list_cache on successful write/remove
+      if (isDbReady() && res.statusCode >= 200 && res.statusCode < 300) {
+        const filePath = decodeFilePath(req);
+        if (filePath) {
+          const url = req.url || '';
+          if (url === '/api/write' && req.method === 'POST') {
+            addToFileListCache(getDb(), filePath);
+          } else if (url === '/api/remove' && req.method === 'GET') {
+            removeFromFileListCache(getDb(), filePath);
+          }
+        }
+      }
     });
 
     switch (route.type) {
@@ -824,16 +837,45 @@ function main(): void {
         return;
       }
 
-      // --- GET /api/list → .meta.meta 이상 필터링 ---
-      // risuai 클라이언트 버그: cleanup 루프가 .meta 파일에도 .meta를 덧붙여
-      // .meta.meta.meta... 체인이 무한 성장 → ENAMETOOLONG 500.
-      // .meta.meta 이상을 list에서 숨겨 체인 성장을 차단한다.
+      // --- GET /api/list ---
+      // SQLite file_list_cache가 있으면 로컬 서빙, 없으면 upstream에서 받아와 캐시 적재.
+      // .meta.meta 이상은 필터링 (클라이언트 버그: 체인 무한 성장 방지).
       case 'list-files': {
+        if (isDbReady() && isFileListCacheReady(getDb())) {
+          try {
+            const paths = getFileListCache(getDb());
+            const filtered = paths.filter((entry) => !entry.includes('.meta.meta'));
+            const body = JSON.stringify({ content: filtered });
+            res.writeHead(200, {
+              'content-type': 'application/json',
+              'content-length': String(Buffer.byteLength(body)),
+              'cache-control': 'no-cache',
+            });
+            res.end(body);
+            return;
+          } catch (err) {
+            log.warn('file_list_cache read failed, falling back to upstream', {
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }
+        // Cache miss or error → fetch from upstream and populate cache
         forwardBufferAndTransform(req, res, (status, _headers, body) => {
           if (status < 200 || status >= 300) return null;
           try {
             const data = JSON.parse(body.toString('utf-8'));
             if (data.content && Array.isArray(data.content)) {
+              // Populate cache from upstream response
+              if (isDbReady()) {
+                setImmediate(() => {
+                  try {
+                    populateFileListCache(getDb(), data.content);
+                    log.info('file_list_cache populated', { entries: data.content.length });
+                  } catch (err) {
+                    log.warn('file_list_cache populate failed', { error: String(err) });
+                  }
+                });
+              }
               data.content = data.content.filter((entry: string) => !entry.includes('.meta.meta'));
             }
             return Buffer.from(JSON.stringify(data), 'utf-8');
