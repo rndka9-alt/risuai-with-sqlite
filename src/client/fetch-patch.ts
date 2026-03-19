@@ -6,7 +6,7 @@
  */
 
 import { tryServeBatchRemote } from './batch-remotes';
-import { tryServeFileList, onFileWrite, onFileRemove } from './file-list-dataset';
+import { tryServeFileList, tryServeMetaRead, onFileWrite, onFileRemove } from './file-list-dataset';
 import { getPluginApis } from '../utils/getPluginApis';
 
 /** Track the most recent job ID from proxy2 responses */
@@ -110,10 +110,18 @@ const patchedFetch: typeof fetch = function (input, init) {
     }
   }
 
-  // Intercept GET /api/read for remote files → serve from batch cache
+  // Intercept GET /api/read for remote files → serve from batch cache or meta dataset
   if (input === '/api/read' && (!init?.method || init.method === 'GET')) {
     const filePath = getHeader(init?.headers, 'file-path');
     if (filePath && filePath.startsWith(REMOTES_HEX_PREFIX)) {
+      // .meta file → serve lastUsed from dataset
+      const decoded = hexToUtf8(filePath);
+      if (decoded.endsWith('.meta') && !decoded.includes('.meta.meta')) {
+        const metaResp = tryServeMetaRead(decoded);
+        if (metaResp) return Promise.resolve(metaResp);
+      }
+
+      // Remote character file → serve from batch cache
       const cached = tryServeBatchRemote(filePath);
       if (cached) {
         return cached.then((resp) =>

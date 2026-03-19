@@ -13,6 +13,7 @@ const FRESHNESS_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 interface FileListDataset {
   files: string[];
+  meta: Record<string, number>; // path → lastUsed
   timestamp: number;
 }
 
@@ -33,6 +34,7 @@ export function installFileListDataset(): void {
       if (!resp.ok) return;
       return resp.json().then((data: FileListDataset) => {
         if (data && Array.isArray(data.files) && typeof data.timestamp === 'number') {
+          if (!data.meta) data.meta = {};
           dataset = data;
         }
       });
@@ -83,6 +85,22 @@ export function onFileRemove(path: string): void {
   if (idx !== -1) {
     dataset.files.splice(idx, 1);
   }
+}
+
+/**
+ * Try to serve a GET /api/read for a .meta file from the cached dataset.
+ * Returns a synthetic Response with { lastUsed } if available, null otherwise.
+ */
+export function tryServeMetaRead(filePath: string): Response | null {
+  if (!dataset || !isFresh()) return null;
+  const lastUsed = dataset.meta[filePath];
+  if (lastUsed === undefined) return null;
+
+  const body = new TextEncoder().encode(JSON.stringify({ lastUsed }));
+  return new Response(body, {
+    status: 200,
+    headers: { 'content-type': 'application/octet-stream' },
+  });
 }
 
 function buildResponse(): Response {

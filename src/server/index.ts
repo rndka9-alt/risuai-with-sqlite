@@ -3,7 +3,7 @@ import http from 'http';
 import { PORT, UPSTREAM, CLIENT_ID_HEADER, REQUEST_ID_HEADER, RISU_AUTH_HEADER, FILE_PATH_HEADER } from './config';
 import { forwardRequest, forwardAndTee, forwardBufferAndTransform, decodeFilePath, fetchFromUpstream } from './proxy';
 import { createCircuitBreaker } from './circuit-breaker';
-import { initDb, resetDb, isDbReady, getDb, getBlock, getBlocksBySource, getAllRemoteBlocks, upsertBlock, upsertChat, upsertCharDetail, getCharDetail, getAllCharDetails, getChat, inTransaction, populateFileListCache, getFileListCache, isFileListCacheReady, addToFileListCache, removeFromFileListCache } from './db';
+import { initDb, resetDb, isDbReady, getDb, getBlock, getBlocksBySource, getAllRemoteBlocks, upsertBlock, upsertChat, upsertCharDetail, getCharDetail, getAllCharDetails, getChat, inTransaction, populateFileListCache, getFileListCache, isFileListCacheReady, addToFileListCache, removeFromFileListCache, upsertMetaLastUsed, getMetaEntries, getMetaMissingLastUsed } from './db';
 import { parseRisuSave, parseRemoteFile, parseRemotePointer } from './parser';
 import { assembleRisuSave } from './assembler';
 import { slimCharacter, deepSlimCharacter } from './slim';
@@ -584,6 +584,10 @@ function main(): void {
           const url = req.url || '';
           if (url === '/api/write' && req.method === 'POST') {
             addToFileListCache(getDb(), filePath);
+            // .meta writes: store lastUsed (write time ≈ client's Date.now())
+            if (filePath.endsWith('.meta') && filePath.startsWith('remotes/') && !filePath.includes('.meta.meta')) {
+              upsertMetaLastUsed(getDb(), filePath, Date.now());
+            }
           } else if (url === '/api/remove' && req.method === 'GET') {
             removeFromFileListCache(getDb(), filePath);
           }
@@ -671,15 +675,51 @@ function main(): void {
           res.end();
           return;
         }
-        const files = getFileListCache(getDb());
-        const filtered = files.filter((f) => !f.includes('.meta.meta'));
-        const payload = JSON.stringify({ files: filtered, timestamp: Date.now() });
-        res.writeHead(200, {
-          'content-type': 'application/json',
-          'content-length': String(Buffer.byteLength(payload)),
-          'cache-control': 'no-cache',
-        });
-        res.end(payload);
+        // Hydrate missing .meta lastUsed from upstream before responding
+        (async () => {
+          try {
+            const db = getDb();
+            const missing = getMetaMissingLastUsed(db);
+            if (missing.length > 0) {
+              const authHeader = typeof req.headers[RISU_AUTH_HEADER] === 'string'
+                ? req.headers[RISU_AUTH_HEADER] : storedAuthHeader;
+              await Promise.all(missing.map(async (metaPath) => {
+                try {
+                  const body = await fetchFromUpstream(metaPath, authHeader);
+                  if (body && body.length > 0) {
+                    const parsed: { lastUsed?: number } = JSON.parse(body.toString('utf-8'));
+                    if (typeof parsed.lastUsed === 'number') {
+                      upsertMetaLastUsed(db, metaPath, parsed.lastUsed);
+                    }
+                  }
+                } catch {
+                  // Skip — client will fall back to normal fetch for this one
+                }
+              }));
+            }
+
+            const files = getFileListCache(db);
+            const filtered = files.filter((f) => !f.includes('.meta.meta'));
+            const metaEntries = getMetaEntries(db);
+            const meta: Record<string, number> = {};
+            for (const entry of metaEntries) {
+              meta[entry.path] = entry.lastUsed;
+            }
+            const payload = JSON.stringify({ files: filtered, meta, timestamp: Date.now() });
+            res.writeHead(200, {
+              'content-type': 'application/json',
+              'content-length': String(Buffer.byteLength(payload)),
+              'cache-control': 'no-cache',
+            });
+            res.end(payload);
+          } catch (err) {
+            log.warn('file-list-dataset error', { error: String(err) });
+            if (!res.headersSent) {
+              res.writeHead(204);
+              res.end();
+            }
+          }
+        })();
         return;
       }
 

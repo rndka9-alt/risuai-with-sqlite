@@ -95,6 +95,7 @@ export function initDb(): Database.Database {
 
     CREATE TABLE IF NOT EXISTS file_list_cache (
       path        TEXT PRIMARY KEY,
+      last_used   INTEGER,
       updated_at  INTEGER DEFAULT (unixepoch())
     );
   `);
@@ -369,6 +370,29 @@ export function addToFileListCache(db: Database.Database, path: string): void {
 
 export function removeFromFileListCache(db: Database.Database, path: string): void {
   prep(db, 'DELETE FROM file_list_cache WHERE path = ?').run(path);
+}
+
+export function upsertMetaLastUsed(db: Database.Database, path: string, lastUsed: number): void {
+  prep(db,
+    `INSERT INTO file_list_cache (path, last_used, updated_at) VALUES (?, ?, unixepoch())
+     ON CONFLICT(path) DO UPDATE SET last_used=excluded.last_used, updated_at=unixepoch()`,
+  ).run(path, lastUsed);
+}
+
+export function getMetaEntries(
+  db: Database.Database,
+): Array<{ path: string; lastUsed: number }> {
+  return prep<{ path: string; lastUsed: number }>(db,
+    'SELECT path, last_used as lastUsed FROM file_list_cache WHERE last_used IS NOT NULL',
+  ).all();
+}
+
+export function getMetaMissingLastUsed(
+  db: Database.Database,
+): string[] {
+  return prep<{ path: string }>(db,
+    "SELECT path FROM file_list_cache WHERE path LIKE 'remotes/%.meta' AND path NOT LIKE '%.meta.meta%' AND last_used IS NULL",
+  ).all().map((r) => r.path);
 }
 
 // --- Job CRUD ---
