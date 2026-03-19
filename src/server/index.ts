@@ -1002,45 +1002,51 @@ function main(): void {
       streamBuffer: 'enabled',
     });
 
-    // Self-auth → proactive hydration (non-blocking)
-    initAuth()
-      .then(async () => {
-        if (!isAuthReady() || !isDbReady()) return;
-        const token = await issueInternalToken();
-        if (!token) return;
+    // Self-auth → API-based proactive hydration (non-blocking)
+    (async () => {
+      await initAuth().catch((e) => log.warn('Self-auth error', { error: String(e) }));
+      if (!isAuthReady() || !isDbReady()) return;
 
-        // Hydrate file list cache
-        const listBody = await fetchFromUpstream('', token, '/api/list');
-        if (listBody && listBody.length > 0) {
-          try {
-            const data: { content?: string[] } = JSON.parse(listBody.toString('utf-8'));
-            if (data.content && Array.isArray(data.content)) {
-              populateFileListCache(getDb(), data.content);
-              log.info('Proactive file_list_cache hydration complete', { entries: data.content.length });
-            }
-          } catch (e) {
-            log.warn('Proactive file list hydration parse error', { error: String(e) });
+      const token = await issueInternalToken();
+      if (!token) return;
+
+      // 1. Hydrate file list cache
+      const listBody = await fetchFromUpstream('', token, '/api/list');
+      if (listBody && listBody.length > 0) {
+        try {
+          const data: { content?: string[] } = JSON.parse(listBody.toString('utf-8'));
+          if (data.content && Array.isArray(data.content)) {
+            populateFileListCache(getDb(), data.content);
+            log.info('Proactive file_list_cache hydration', { entries: data.content.length });
           }
+        } catch (e) {
+          log.warn('File list hydration parse error', { error: String(e) });
         }
+      }
 
-        // Hydrate .meta lastUsed
-        const missing = getMetaMissingLastUsed(getDb());
-        if (missing.length > 0) {
-          await Promise.all(missing.map(async (metaPath) => {
-            try {
-              const body = await fetchFromUpstream(metaPath, token);
-              if (body && body.length > 0) {
-                const parsed: { lastUsed?: number } = JSON.parse(body.toString('utf-8'));
-                if (typeof parsed.lastUsed === 'number') {
-                  upsertMetaLastUsed(getDb(), metaPath, parsed.lastUsed);
-                }
+      // 2. Hydrate .meta lastUsed
+      const missing = getMetaMissingLastUsed(getDb());
+      if (missing.length > 0) {
+        await Promise.all(missing.map(async (metaPath) => {
+          try {
+            const body = await fetchFromUpstream(metaPath, token);
+            if (body && body.length > 0) {
+              const parsed: { lastUsed?: number } = JSON.parse(body.toString('utf-8'));
+              if (typeof parsed.lastUsed === 'number') {
+                upsertMetaLastUsed(getDb(), metaPath, parsed.lastUsed);
               }
-            } catch { /* skip */ }
-          }));
-          log.info('Proactive .meta hydration complete', { count: missing.length });
-        }
-      })
-      .catch((e) => log.warn('Proactive hydration error', { error: String(e) }));
+            }
+          } catch { /* skip */ }
+        }));
+        log.info('Proactive .meta hydration', { count: missing.length });
+      }
+
+      // 3. Hydrate database.bin → blocks + remotes
+      const dbBody = await fetchFromUpstream('database/database.bin', token);
+      if (dbBody && dbBody.length > 0) {
+        captureDatabaseBin(dbBody, token);
+      }
+    })();
   });
 }
 
