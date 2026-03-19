@@ -1,8 +1,9 @@
 /**
  * Monkey-patch fetch to:
- * 1. Add x-dbproxy-target-char header to POST /proxy2 requests
- * 2. Capture x-dbproxy-job-id from response headers
- * 3. Serve remote file reads from batch cache when available
+ * 1. Capture risu-auth from /api/* requests, inject into /db/* requests
+ * 2. Add x-dbproxy-target-char header to POST /proxy2 requests
+ * 3. Capture x-dbproxy-job-id from response headers
+ * 4. Serve remote file reads from batch cache when available
  */
 
 import { tryServeBatchRemote } from './batch-remotes';
@@ -11,6 +12,9 @@ import { getPluginApis } from '../utils/getPluginApis';
 
 /** Track the most recent job ID from proxy2 responses */
 export let lastJobId: string | null = null;
+
+/** Cached risu-auth token captured from /api/* requests */
+let cachedAuth: string | null = null;
 
 /**
  * Find the character most likely to be the target of the next LLM request.
@@ -80,6 +84,19 @@ function setHeader(headers: HeadersInit, key: string, value: string): void {
 const originalFetch = window.fetch;
 
 const patchedFetch: typeof fetch = function (input, init) {
+  // Capture risu-auth from /api/* requests
+  if (typeof input === 'string' && input.startsWith('/api/')) {
+    const auth = getHeader(init?.headers, 'risu-auth');
+    if (auth) cachedAuth = auth;
+  }
+
+  // Inject cached risu-auth into /db/* requests
+  if (typeof input === 'string' && input.startsWith('/db/') && cachedAuth) {
+    if (!init) init = {};
+    if (!init.headers) init.headers = {};
+    setHeader(init.headers, 'risu-auth', cachedAuth);
+  }
+
   // Only intercept POST /proxy2
   if (init?.method === 'POST' && (input === '/proxy2' || (typeof input === 'string' && input.startsWith('/proxy2?')))) {
     if (!init.headers) init.headers = {};

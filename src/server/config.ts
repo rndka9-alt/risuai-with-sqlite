@@ -32,6 +32,13 @@ export const RISU_AUTH_HEADER = 'risu-auth';
 export const DBPROXY_TARGET_HEADER = 'x-dbproxy-target-char';
 export const DBPROXY_JOB_ID_HEADER = 'x-dbproxy-job-id';
 
+/** Auth check를 건너뛰는 db- 라우트 타입 목록 (읽기 전용·캐시 워밍용) */
+export const AUTH_EXEMPT_ROUTES: ReadonlySet<string> = new Set([
+  'db-client-js',
+  'db-batch-remotes',
+  'db-file-list-dataset',
+]);
+
 // RisuAI save mount
 export { RISUAI_SAVE_MOUNT };
 

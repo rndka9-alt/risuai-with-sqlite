@@ -1,6 +1,6 @@
 import crypto from 'crypto';
 import http from 'http';
-import { PORT, UPSTREAM, CLIENT_ID_HEADER, REQUEST_ID_HEADER, RISU_AUTH_HEADER, FILE_PATH_HEADER } from './config';
+import { PORT, UPSTREAM, CLIENT_ID_HEADER, REQUEST_ID_HEADER, RISU_AUTH_HEADER, FILE_PATH_HEADER, AUTH_EXEMPT_ROUTES } from './config';
 import { forwardRequest, forwardAndTee, forwardBufferAndTransform, decodeFilePath, fetchFromUpstream } from './proxy';
 import { createCircuitBreaker } from './circuit-breaker';
 import { initDb, resetDb, isDbReady, getDb, getBlock, getBlocksBySource, getAllRemoteBlocks, upsertBlock, upsertChat, upsertCharDetail, getCharDetail, getAllCharDetails, getChat, inTransaction, populateFileListCache, getFileListCache, isFileListCacheReady, addToFileListCache, removeFromFileListCache, upsertMetaLastUsed, getMetaEntries, getMetaMissingLastUsed } from './db';
@@ -600,7 +600,7 @@ function main(): void {
     });
 
     // --- Auth check for /db/* data endpoints ---
-    if (route.type.startsWith('db-') && route.type !== 'db-client-js') {
+    if (route.type.startsWith('db-') && !AUTH_EXEMPT_ROUTES.has(route.type)) {
       const clientAuth = typeof req.headers[RISU_AUTH_HEADER] === 'string'
         ? req.headers[RISU_AUTH_HEADER] : null;
       if (!clientAuth) {

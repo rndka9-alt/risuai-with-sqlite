@@ -20,10 +20,10 @@ export function getClientJs(): string {
 
 /**
  * Inject our client script tag into HTML response.
- * Inserts `<script defer src="/db/client.js"></script>` before </head>.
+ * Synchronous load so fetch patch captures risu-auth from the earliest /api/* calls.
  */
 export function injectScriptTag(html: string): string {
-  const tag = '<script defer src="/db/client.js"></script>';
+  const tag = '<script src="/db/client.js"></script>';
   const headClose = html.indexOf('</head>');
   if (headClose !== -1) {
     return html.slice(0, headClose) + tag + html.slice(headClose);
