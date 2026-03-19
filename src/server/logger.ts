@@ -44,5 +44,3 @@ export function warn(message: string, data?: { [key: string]: unknown }): void {
 export function error(message: string, data?: { [key: string]: unknown }): void {
   log('error', 3, message, data);
 }
-
-export const isDebug = currentLevel === 0;

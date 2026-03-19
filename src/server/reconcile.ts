@@ -1,12 +1,10 @@
-import crypto from 'crypto';
 import Database from 'better-sqlite3';
 import { getBlockHash, upsertBlock, upsertChat, upsertCharDetail, deleteChatsByCharId, inTransaction } from './db';
 import { parseRisuSave, parseRemoteFile, parseRemotePointer } from './parser';
-import { slimCharacter, deepSlimCharacter } from './slim';
-import { compressColdStorage } from './cold-compat';
+import { slimRemote } from './slim';
 import { writeToUpstream } from './proxy';
 import { RisuSaveType } from '../shared/types';
-import { setUsePlainFetch } from './proxy-config-state';
+import { extractUsePlainFetch } from './proxy-config-state';
 import * as log from './logger';
 
 /**
@@ -48,14 +46,7 @@ export function reconcileDatabaseBin(
 
       // Update usePlainFetch from ROOT block (always, regardless of drift)
       if (block.type === RisuSaveType.ROOT) {
-        try {
-          const parsed: Record<string, unknown> = JSON.parse(block.data.toString('utf-8'));
-          if (typeof parsed.usePlainFetch === 'boolean') {
-            setUsePlainFetch(parsed.usePlainFetch);
-          }
-        } catch {
-          // ignore parse failure
-        }
+        extractUsePlainFetch(block.data);
       }
     }
   });
@@ -86,46 +77,22 @@ export async function reconcileRemoteFile(
 
   // Hash differs — re-slim
   const charJson = block.data.toString('utf-8');
-
-  // Phase 1: slim chats (parallel gzip on libuv threads)
-  const { slimJson: chatSlimJson, coldEntries } = await slimCharacter(charJson, charId);
-
-  // Phase 2: deep slim (strip heavy fields)
-  const { slimJson: deepSlimJson, detailJson } = deepSlimCharacter(chatSlimJson);
-  const deepSlimBuffer = Buffer.from(deepSlimJson, 'utf-8');
-  const detailCompressed = await compressColdStorage(detailJson);
-  const detailHash = crypto.createHash('sha256').update(detailJson).digest('hex');
+  const slimmed = await slimRemote(charJson, charId);
 
   inTransaction(db, () => {
-    // Remove old cold entries for this character
     deleteChatsByCharId(db, charId);
-
-    // Store new deep-slim data
-    upsertBlock(
-      db,
-      `remote:${charId}`,
-      RisuSaveType.CHARACTER_WITH_CHAT,
-      `remote:${charId}`,
-      0,
-      deepSlimBuffer,
-      block.hash,
-    );
-
-    // Store detail fields
-    upsertCharDetail(db, charId, detailCompressed, detailHash);
-
-    // Store new cold entries
-    for (const entry of coldEntries) {
+    upsertBlock(db, `remote:${charId}`, RisuSaveType.CHARACTER_WITH_CHAT, `remote:${charId}`, 0, slimmed.deepSlimBuffer, block.hash);
+    upsertCharDetail(db, charId, slimmed.detailCompressed, slimmed.detailHash);
+    for (const entry of slimmed.coldEntries) {
       upsertChat(db, entry.uuid, entry.charId, entry.chatIndex, entry.compressed, entry.hash);
     }
   });
 
-  // Write-back cold entries to upstream for FS consistency
-  for (const entry of coldEntries) {
+  for (const entry of slimmed.coldEntries) {
     writeToUpstream(`coldstorage/${entry.uuid}`, entry.compressed, authHeader);
   }
 
-  log.info('Reconcile remote updated', { charId, coldEntries: coldEntries.length });
+  log.info('Reconcile remote updated', { charId, coldEntries: slimmed.coldEntries.length });
 
   return true;
 }

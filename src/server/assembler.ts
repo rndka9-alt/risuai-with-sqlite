@@ -14,7 +14,7 @@ interface BlockInput {
  * Encode a single block into its binary representation (without magic header).
  * Format: type:u8, compression:u8, nameLen:u8, name:string, dataLen:u32LE, data:buffer
  */
-export function encodeBlock(input: BlockInput): Buffer {
+function encodeBlock(input: BlockInput): Buffer {
   const nameBytes = Buffer.from(input.name, 'utf-8');
   let data = input.data;
 

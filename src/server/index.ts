@@ -6,8 +6,8 @@ import { createCircuitBreaker } from './circuit-breaker';
 import { initDb, resetDb, isDbReady, getDb, getBlock, getBlocksBySource, getAllRemoteBlocks, upsertBlock, upsertChat, upsertCharDetail, getCharDetail, getAllCharDetails, getChat, inTransaction, populateFileListCache, getFileListCache, isFileListCacheReady, addToFileListCache, removeFromFileListCache, upsertMetaLastUsed, getMetaEntries, getMetaMissingLastUsed } from './db';
 import { parseRisuSave, parseRemoteFile, parseRemotePointer } from './parser';
 import { assembleRisuSave } from './assembler';
-import { slimCharacter, deepSlimCharacter } from './slim';
-import { compressColdStorage, decompressColdStorage } from './cold-compat';
+import { slimRemote } from './slim';
+import { decompressColdStorage } from './cold-compat';
 import { writeToUpstream } from './proxy';
 import { handleWriteDatabase, handleWriteRemote } from './write-handler';
 import { handleRemoveAsset } from './remove-handler';
@@ -16,7 +16,7 @@ import { handleProxy2, handleGetActiveJobs, handleJobStream, handleJobAbort, han
 import { getClientJs, injectScriptTag } from './client-bundle';
 import * as log from './logger';
 import { RisuSaveType, toRisuSaveType, type HydrationState } from '../shared/types';
-import { getUsePlainFetch, setUsePlainFetch } from './proxy-config-state';
+import { getUsePlainFetch, extractUsePlainFetch } from './proxy-config-state';
 import { initAuth, isAuthReady, issueInternalToken, verifyClientAuth } from './auth';
 import { startPeriodicSync } from './periodic-sync';
 
@@ -161,6 +161,28 @@ const pendingBatchRequests: Array<{ res: http.ServerResponse; timer: ReturnType<
 
 const BATCH_WAIT_TIMEOUT_MS = 30_000;
 
+function serializeBatchRemotes(remotes: Array<{ name: string; data: Buffer }>): Buffer {
+  let totalSize = 4;
+  for (const r of remotes) {
+    const charId = r.name.slice(7); // strip 'remote:'
+    totalSize += 1 + Buffer.byteLength(charId) + 4 + r.data.length;
+  }
+
+  const buf = Buffer.alloc(totalSize);
+  let off = 0;
+  buf.writeUInt32LE(remotes.length, off); off += 4;
+  for (const r of remotes) {
+    const charId = r.name.slice(7);
+    const charIdBuf = Buffer.from(charId, 'utf-8');
+    buf[off++] = charIdBuf.length;
+    charIdBuf.copy(buf, off); off += charIdBuf.length;
+    buf.writeUInt32LE(r.data.length, off); off += 4;
+    r.data.copy(buf, off); off += r.data.length;
+  }
+
+  return buf;
+}
+
 /**
  * If all expected remotes have been captured, transition to HOT and flush
  * pending batch requests. Returns the resolved hydration state so callers
@@ -181,24 +203,7 @@ function flushPendingBatchRequests(): void {
 
   const db = getDb();
   const remotes = getAllRemoteBlocks(db);
-
-  let totalSize = 4;
-  for (const r of remotes) {
-    const charId = r.name.slice(7);
-    totalSize += 1 + Buffer.byteLength(charId) + 4 + r.data.length;
-  }
-
-  const buf = Buffer.alloc(totalSize);
-  let off = 0;
-  buf.writeUInt32LE(remotes.length, off); off += 4;
-  for (const r of remotes) {
-    const charId = r.name.slice(7);
-    const charIdBuf = Buffer.from(charId, 'utf-8');
-    buf[off++] = charIdBuf.length;
-    charIdBuf.copy(buf, off); off += charIdBuf.length;
-    buf.writeUInt32LE(r.data.length, off); off += 4;
-    r.data.copy(buf, off); off += r.data.length;
-  }
+  const buf = serializeBatchRemotes(remotes);
 
   log.info('Flushing pending batch-remotes', { count: String(pendingBatchRequests.length), remotes: String(remotes.length) });
 
@@ -214,6 +219,29 @@ function flushPendingBatchRequests(): void {
     }
   }
   pendingBatchRequests.length = 0;
+}
+
+/** Fetch missing .meta lastUsed values from upstream and store in DB. */
+async function hydrateMissingMetaLastUsed(
+  db: import('better-sqlite3').Database,
+  authHeader: string | undefined,
+): Promise<void> {
+  const missing = getMetaMissingLastUsed(db);
+  if (missing.length === 0) return;
+
+  await Promise.all(missing.map(async (metaPath) => {
+    try {
+      const body = await fetchFromUpstream(metaPath, authHeader);
+      if (body && body.length > 0) {
+        const parsed: { lastUsed?: number } = JSON.parse(body.toString('utf-8'));
+        if (typeof parsed.lastUsed === 'number') {
+          upsertMetaLastUsed(db, metaPath, parsed.lastUsed);
+        }
+      }
+    } catch {
+      // Skip — client will fall back to normal fetch
+    }
+  }));
 }
 
 /** Proactively fetch all remotes from upstream after database.bin is captured. */
@@ -290,33 +318,19 @@ async function captureRemoteFile(body: Buffer, charId: string, authHeader: strin
   const charJson = block.data.toString('utf-8');
   const t1 = performance.now();
 
-  // Phase 1: slim chats → cold markers (parallel gzip on libuv threads)
-  const { slimJson: chatSlimJson, coldEntries } = await slimCharacter(charJson, charId);
+  const slimmed = await slimRemote(charJson, charId);
   const t2 = performance.now();
 
-  // Phase 2: deep slim → compress → DB → upstream write
-  //
-  // This pipeline is intentionally duplicated with handleWriteRemote() in write-handler.ts.
-  // Both load character data into the SQLite cache, but in different contexts:
-  //   - here: proactive hydration from upstream (awaited, owns db access, tracks hydration state)
-  //   - handleWriteRemote: background processing after a client write-through (setImmediate, db passed in, error-logged)
-  // Merging would couple the hydration lifecycle to the write path.
-  const { slimJson: deepSlimJson, detailJson } = deepSlimCharacter(chatSlimJson);
-  const deepSlimBuffer = Buffer.from(deepSlimJson, 'utf-8');
-  const detailCompressed = await compressColdStorage(detailJson);
-  const detailHash = crypto.createHash('sha256').update(detailJson).digest('hex');
-  const t3 = performance.now();
-
   inTransaction(db, () => {
-    upsertBlock(db, `remote:${charId}`, RisuSaveType.CHARACTER_WITH_CHAT, `remote:${charId}`, 0, deepSlimBuffer, block.hash);
-    upsertCharDetail(db, charId, detailCompressed, detailHash);
-    for (const entry of coldEntries) {
+    upsertBlock(db, `remote:${charId}`, RisuSaveType.CHARACTER_WITH_CHAT, `remote:${charId}`, 0, slimmed.deepSlimBuffer, block.hash);
+    upsertCharDetail(db, charId, slimmed.detailCompressed, slimmed.detailHash);
+    for (const entry of slimmed.coldEntries) {
       upsertChat(db, entry.uuid, entry.charId, entry.chatIndex, entry.compressed, entry.hash);
     }
   });
-  const t4 = performance.now();
+  const t3 = performance.now();
 
-  for (const entry of coldEntries) {
+  for (const entry of slimmed.coldEntries) {
     writeToUpstream(`coldstorage/${entry.uuid}`, entry.compressed, authHeader);
   }
 
@@ -324,12 +338,11 @@ async function captureRemoteFile(body: Buffer, charId: string, authHeader: strin
   log.info('captureRemoteFile timing', {
     charId,
     bodyKB: String((body.length / 1024).toFixed(0)),
-    coldEntries: String(coldEntries.length),
+    coldEntries: String(slimmed.coldEntries.length),
     parse: (t1 - t0).toFixed(0) + 'ms',
     slim: (t2 - t1).toFixed(0) + 'ms',
-    deepSlim: (t3 - t2).toFixed(0) + 'ms',
-    sqlite: (t4 - t3).toFixed(0) + 'ms',
-    total: (t4 - t0).toFixed(0) + 'ms',
+    sqlite: (t3 - t2).toFixed(0) + 'ms',
+    total: (t3 - t0).toFixed(0) + 'ms',
     captured: capturedRemotes.size + '/' + expectedRemoteCount,
   });
   hydrationState = resolveHydration();
@@ -465,19 +478,6 @@ function handleRootHtml(req: http.IncomingMessage, res: http.ServerResponse): vo
     if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain' });
     res.end('Bad Gateway');
   });
-}
-
-// --- usePlainFetch extraction ---
-
-function extractUsePlainFetch(rootBlockData: Buffer): void {
-  try {
-    const parsed: Record<string, unknown> = JSON.parse(rootBlockData.toString('utf-8'));
-    if (typeof parsed.usePlainFetch === 'boolean') {
-      setUsePlainFetch(parsed.usePlainFetch);
-    }
-  } catch {
-    // ROOT block parse failure — ignore, usePlainFetch stays unknown
-  }
 }
 
 // --- Proxy config handler ---
@@ -707,24 +707,9 @@ function main(): void {
         (async () => {
           try {
             const db = getDb();
-            const missing = getMetaMissingLastUsed(db);
-            if (missing.length > 0) {
-              const authHeader = typeof req.headers[RISU_AUTH_HEADER] === 'string'
-                ? req.headers[RISU_AUTH_HEADER] : storedAuthHeader;
-              await Promise.all(missing.map(async (metaPath) => {
-                try {
-                  const body = await fetchFromUpstream(metaPath, authHeader);
-                  if (body && body.length > 0) {
-                    const parsed: { lastUsed?: number } = JSON.parse(body.toString('utf-8'));
-                    if (typeof parsed.lastUsed === 'number') {
-                      upsertMetaLastUsed(db, metaPath, parsed.lastUsed);
-                    }
-                  }
-                } catch {
-                  // Skip — client will fall back to normal fetch for this one
-                }
-              }));
-            }
+            const authHeader = typeof req.headers[RISU_AUTH_HEADER] === 'string'
+              ? req.headers[RISU_AUTH_HEADER] : storedAuthHeader;
+            await hydrateMissingMetaLastUsed(db, authHeader);
 
             const files = getFileListCache(db);
             const filtered = files.filter((f) => !f.includes('.meta.meta'));
@@ -780,25 +765,7 @@ function main(): void {
         }
         const db = getDb();
         const remotes = getAllRemoteBlocks(db);
-
-        let totalSize = 4;
-        for (const r of remotes) {
-          const charId = r.name.slice(7); // strip 'remote:'
-          totalSize += 1 + Buffer.byteLength(charId) + 4 + r.data.length;
-        }
-
-        const buf = Buffer.alloc(totalSize);
-        let off = 0;
-        buf.writeUInt32LE(remotes.length, off); off += 4;
-
-        for (const r of remotes) {
-          const charId = r.name.slice(7);
-          const charIdBuf = Buffer.from(charId, 'utf-8');
-          buf[off++] = charIdBuf.length;
-          charIdBuf.copy(buf, off); off += charIdBuf.length;
-          buf.writeUInt32LE(r.data.length, off); off += 4;
-          r.data.copy(buf, off); off += r.data.length;
-        }
+        const buf = serializeBatchRemotes(remotes);
 
         res.writeHead(200, {
           'content-type': 'application/octet-stream',
@@ -1026,21 +993,7 @@ function main(): void {
       }
 
       // 2. Hydrate .meta lastUsed
-      const missing = getMetaMissingLastUsed(getDb());
-      if (missing.length > 0) {
-        await Promise.all(missing.map(async (metaPath) => {
-          try {
-            const body = await fetchFromUpstream(metaPath, token);
-            if (body && body.length > 0) {
-              const parsed: { lastUsed?: number } = JSON.parse(body.toString('utf-8'));
-              if (typeof parsed.lastUsed === 'number') {
-                upsertMetaLastUsed(getDb(), metaPath, parsed.lastUsed);
-              }
-            }
-          } catch { /* skip */ }
-        }));
-        log.info('Proactive .meta hydration', { count: missing.length });
-      }
+      await hydrateMissingMetaLastUsed(getDb(), token);
 
       // 3. Hydrate database.bin → blocks + remotes
       const dbBody = await fetchFromUpstream('database/database.bin', token);

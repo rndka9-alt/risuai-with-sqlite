@@ -1,11 +1,10 @@
 import http from 'http';
-import crypto from 'crypto';
 import Database from 'better-sqlite3';
 import { RISU_AUTH_HEADER } from './config';
 import { bufferBody, forwardBuffered, writeToUpstream } from './proxy';
 import { parseRisuSave, parseRemoteFile, parseRemotePointer } from './parser';
-import { slimCharacter, deepSlimCharacter, mergeCharacterDetail } from './slim';
-import { compressColdStorage, decompressColdStorage } from './cold-compat';
+import { slimRemote, mergeCharacterDetail } from './slim';
+import { decompressColdStorage } from './cold-compat';
 import { upsertBlock, upsertChat, upsertCharDetail, getCharDetail, purgeStaleCharDetails, inTransaction } from './db';
 import { RisuSaveType } from '../shared/types';
 import * as log from './logger';
@@ -121,39 +120,17 @@ export async function handleWriteRemote(
       if (!block) return;
 
       const charJson = block.data.toString('utf-8');
-
-      // Phase 1: slim chats → cold markers
-      const { slimJson: chatSlimJson, coldEntries } = await slimCharacter(charJson, charId);
-
-      // Phase 2: deep slim → compress → DB → upstream write
-      //
-      // This pipeline is intentionally duplicated with captureRemoteFile() in index.ts.
-      // Both load character data into the SQLite cache, but in different contexts:
-      //   - here: background processing after a client write-through (setImmediate, db passed in, error-logged)
-      //   - captureRemoteFile: proactive hydration from upstream (awaited, owns db access, tracks hydration state)
-      // Merging would couple the write path to the hydration lifecycle.
-      const { slimJson: deepSlimJson, detailJson } = deepSlimCharacter(chatSlimJson);
-      const deepSlimBuffer = Buffer.from(deepSlimJson, 'utf-8');
-      const detailCompressed = await compressColdStorage(detailJson);
-      const detailHash = crypto.createHash('sha256').update(detailJson).digest('hex');
+      const slimmed = await slimRemote(charJson, charId);
 
       inTransaction(db, () => {
-        upsertBlock(
-          db,
-          `remote:${charId}`,
-          RisuSaveType.CHARACTER_WITH_CHAT,
-          `remote:${charId}`,
-          0,
-          deepSlimBuffer,
-          block.hash,
-        );
-        upsertCharDetail(db, charId, detailCompressed, detailHash);
-        for (const entry of coldEntries) {
+        upsertBlock(db, `remote:${charId}`, RisuSaveType.CHARACTER_WITH_CHAT, `remote:${charId}`, 0, slimmed.deepSlimBuffer, block.hash);
+        upsertCharDetail(db, charId, slimmed.detailCompressed, slimmed.detailHash);
+        for (const entry of slimmed.coldEntries) {
           upsertChat(db, entry.uuid, entry.charId, entry.chatIndex, entry.compressed, entry.hash);
         }
       });
 
-      for (const entry of coldEntries) {
+      for (const entry of slimmed.coldEntries) {
         writeToUpstream(`coldstorage/${entry.uuid}`, entry.compressed, authHeader);
       }
     } catch (err) {

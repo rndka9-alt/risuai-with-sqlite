@@ -28,13 +28,6 @@ export function startPeriodicSync(getDb: () => Database.Database): void {
   log.info('Periodic sync scheduled', { intervalHours: 24 });
 }
 
-export function stopPeriodicSync(): void {
-  if (timer) {
-    clearInterval(timer);
-    timer = null;
-  }
-}
-
 async function runSync(getDb: () => Database.Database): Promise<void> {
   if (!isAuthReady()) {
     log.warn('Periodic sync skipped — auth not ready');

@@ -9,7 +9,7 @@ const RISUAI_SAVE_MOUNT = '/risuai-save';
 export const PORT = parseInt(process.env.PORT || '3001', 10);
 
 const upstreamRaw = process.env.UPSTREAM;
-export const UPSTREAM_URL = new URL(upstreamRaw);
+const UPSTREAM_URL = new URL(upstreamRaw);
 export const UPSTREAM = {
   hostname: UPSTREAM_URL.hostname,
   port: parseInt(UPSTREAM_URL.port || (UPSTREAM_URL.protocol === 'https:' ? '443' : '80'), 10),

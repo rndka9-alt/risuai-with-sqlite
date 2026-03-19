@@ -186,10 +186,6 @@ export function getBlockHash(
   return row?.hash;
 }
 
-export function deleteBlock(db: Database.Database, name: string): void {
-  prep(db, 'DELETE FROM blocks WHERE name = ?').run(name);
-}
-
 export function blockCount(db: Database.Database): number {
   const row = prep<{ cnt: number }>(db, 'SELECT COUNT(*) as cnt FROM blocks').get();
   return row?.cnt ?? 0;
@@ -287,10 +283,6 @@ export function getAllCharDetails(
   return prep<CharDetailRow>(db,
     'SELECT char_id as charId, data, hash FROM char_details',
   ).all();
-}
-
-export function deleteCharDetail(db: Database.Database, charId: string): void {
-  prep(db, 'DELETE FROM char_details WHERE char_id = ?').run(charId);
 }
 
 /**

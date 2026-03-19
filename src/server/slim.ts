@@ -177,6 +177,26 @@ export function deepSlimCharacter(characterJson: string): DeepSlimResult {
   };
 }
 
+export interface SlimmedRemote {
+  deepSlimBuffer: Buffer;
+  detailCompressed: Buffer;
+  detailHash: string;
+  coldEntries: ColdEntry[];
+}
+
+/**
+ * Compute-only slim pipeline: chat cold-storage + deep-slim + compress.
+ * No DB writes or upstream I/O — callers compose their own side-effects.
+ */
+export async function slimRemote(charJson: string, charId: string): Promise<SlimmedRemote> {
+  const { slimJson: chatSlimJson, coldEntries } = await slimCharacter(charJson, charId);
+  const { slimJson: deepSlimJson, detailJson } = deepSlimCharacter(chatSlimJson);
+  const deepSlimBuffer = Buffer.from(deepSlimJson, 'utf-8');
+  const detailCompressed = await compressColdStorage(detailJson);
+  const detailHash = crypto.createHash('sha256').update(detailJson).digest('hex');
+  return { deepSlimBuffer, detailCompressed, detailHash, coldEntries };
+}
+
 /**
  * Merge stored detail fields back into a character JSON that has __strippedFields.
  * Returns the full character JSON with detail restored and __strippedFields removed.

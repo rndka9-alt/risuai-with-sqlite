@@ -27,7 +27,6 @@ vi.mock('./logger', () => ({
   info: vi.fn(),
   warn: vi.fn(),
   error: vi.fn(),
-  isDebug: false,
 }));
 
 import { bufferBody, forwardBuffered, writeToUpstream } from './proxy';
