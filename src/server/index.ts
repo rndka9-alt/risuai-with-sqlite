@@ -585,12 +585,12 @@ function main(): void {
       }
       log.info('Response', logFields);
 
-      // Sync file_list_cache on successful write/remove
-      if (isDbReady() && res.statusCode >= 200 && res.statusCode < 300) {
+      // Sync file_list_cache on write/remove
+      if (isDbReady()) {
         const filePath = decodeFilePath(req);
         if (filePath) {
           const url = req.url || '';
-          if (url === '/api/write' && req.method === 'POST') {
+          if (url === '/api/write' && req.method === 'POST' && res.statusCode >= 200 && res.statusCode < 300) {
             addToFileListCache(getDb(), filePath);
             // .meta writes: store lastUsed (write time ≈ client's Date.now())
             if (filePath.endsWith('.meta') && filePath.startsWith('remotes/') && !filePath.includes('.meta.meta')) {

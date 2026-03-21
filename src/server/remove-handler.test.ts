@@ -68,9 +68,31 @@ describe('handleRemoveFile', () => {
     expect(forwardAndTee).toHaveBeenCalledWith(req, res, expect.any(Function));
   });
 
-  it('removes ghost entry from cache when upstream returns 500 + ENOENT', () => {
+  it('cleans cache entry on 2xx success', () => {
     addToFileListCache(db, 'database/dbbackup-123.bin');
     expect(getFileListCache(db)).toContain('database/dbbackup-123.bin');
+
+    handleRemoveFile(createMockReq(), createMockRes(), 'database/dbbackup-123.bin', db);
+
+    const cb = getTeeCallback();
+    cb(200, Buffer.from('{"success":true}'));
+
+    expect(getFileListCache(db)).not.toContain('database/dbbackup-123.bin');
+  });
+
+  it('cleans cache entry on 500 without ENOENT in body', () => {
+    addToFileListCache(db, 'database/dbbackup-123.bin');
+
+    handleRemoveFile(createMockReq(), createMockRes(), 'database/dbbackup-123.bin', db);
+
+    const cb = getTeeCallback();
+    cb(500, Buffer.from('Internal Server Error'));
+
+    expect(getFileListCache(db)).not.toContain('database/dbbackup-123.bin');
+  });
+
+  it('cleans cache entry on 500 with ENOENT in body', () => {
+    addToFileListCache(db, 'database/dbbackup-123.bin');
 
     handleRemoveFile(createMockReq(), createMockRes(), 'database/dbbackup-123.bin', db);
 
@@ -78,24 +100,9 @@ describe('handleRemoveFile', () => {
     cb(500, Buffer.from('Error: ENOENT: no such file or directory, lstat \'/app/save/xxx\''));
 
     expect(getFileListCache(db)).not.toContain('database/dbbackup-123.bin');
-    expect(log.info).toHaveBeenCalledWith(
-      'Remove got ENOENT from upstream, cleaning ghost cache entry',
-      expect.objectContaining({ filePath: 'database/dbbackup-123.bin' }),
-    );
   });
 
-  it('does NOT remove from cache when upstream returns 500 without ENOENT', () => {
-    addToFileListCache(db, 'database/dbbackup-123.bin');
-
-    handleRemoveFile(createMockReq(), createMockRes(), 'database/dbbackup-123.bin', db);
-
-    const cb = getTeeCallback();
-    cb(500, Buffer.from('Internal Server Error: disk full'));
-
-    expect(getFileListCache(db)).toContain('database/dbbackup-123.bin');
-  });
-
-  it('does NOT remove from cache when upstream returns 502', () => {
+  it('cleans cache entry on 502', () => {
     addToFileListCache(db, 'database/dbbackup-123.bin');
 
     handleRemoveFile(createMockReq(), createMockRes(), 'database/dbbackup-123.bin', db);
@@ -103,30 +110,7 @@ describe('handleRemoveFile', () => {
     const cb = getTeeCallback();
     cb(502, Buffer.from('Bad Gateway'));
 
-    expect(getFileListCache(db)).toContain('database/dbbackup-123.bin');
-  });
-
-  it('does NOT call removeFromFileListCache on 2xx (handled by index.ts finish handler)', () => {
-    addToFileListCache(db, 'database/dbbackup-123.bin');
-
-    handleRemoveFile(createMockReq(), createMockRes(), 'database/dbbackup-123.bin', db);
-
-    const cb = getTeeCallback();
-    cb(200, Buffer.from('{"success":true}'));
-
-    // Entry still in cache — the finish handler in index.ts handles this case
-    expect(getFileListCache(db)).toContain('database/dbbackup-123.bin');
-  });
-
-  it('handles ENOENT in HTML error body (Express development mode)', () => {
-    addToFileListCache(db, 'remotes/abc.local.bin.meta');
-
-    handleRemoveFile(createMockReq(), createMockRes(), 'remotes/abc.local.bin.meta', db);
-
-    const cb = getTeeCallback();
-    cb(500, Buffer.from('<html><pre>Error: ENOENT: no such file or directory</pre></html>'));
-
-    expect(getFileListCache(db)).not.toContain('remotes/abc.local.bin.meta');
+    expect(getFileListCache(db)).not.toContain('database/dbbackup-123.bin');
   });
 
   it('is safe when entry is not in cache (no-op)', () => {
@@ -134,8 +118,20 @@ describe('handleRemoveFile', () => {
 
     const cb = getTeeCallback();
     // Should not throw
-    cb(500, Buffer.from('ENOENT: no such file or directory'));
+    cb(500, Buffer.from('Internal Server Error'));
 
     expect(getFileListCache(db)).toHaveLength(0);
+  });
+
+  it('logs filePath and status on every remove', () => {
+    handleRemoveFile(createMockReq(), createMockRes(), 'database/dbbackup-123.bin', db);
+
+    const cb = getTeeCallback();
+    cb(500, Buffer.from(''));
+
+    expect(log.info).toHaveBeenCalledWith(
+      'Remove forwarded, cleaning cache entry',
+      expect.objectContaining({ filePath: 'database/dbbackup-123.bin', status: '500' }),
+    );
   });
 });

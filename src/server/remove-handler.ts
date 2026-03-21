@@ -83,13 +83,13 @@ export async function handleRemoveAsset(
 /**
  * Handle GET /api/remove for non-asset files (e.g. database/dbbackup-*.bin).
  *
- * Uses forwardAndTee to inspect the upstream response body.
- * If upstream returns 500 with ENOENT (file already gone), cleans
- * the ghost entry from file_list_cache so /api/list stops returning it.
+ * Uses forwardAndTee to forward the request and always cleans the
+ * file_list_cache entry regardless of upstream status.
  *
- * 2xx success → cache cleaned by the res.on('finish') handler in index.ts.
- * 500 + ENOENT → cache cleaned here (ghost entry removal).
- * Other errors → cache untouched (file may still exist).
+ * Remove is idempotent: whether upstream returns 2xx (file deleted) or
+ * 500 (file already gone / ENOENT), the file should not appear in
+ * /api/list afterwards. The res.on('finish') handler in index.ts
+ * also cleans the cache as a secondary guarantee.
  */
 export function handleRemoveFile(
   req: http.IncomingMessage,
@@ -97,17 +97,8 @@ export function handleRemoveFile(
   filePath: string,
   db: Database.Database,
 ): void {
-  forwardAndTee(req, res, (status, body) => {
-    if (status >= 200 && status < 300) {
-      // 2xx: res.on('finish') handler in index.ts handles cache removal
-      return;
-    }
-    if (status === 500) {
-      const bodyStr = body.toString('utf-8');
-      if (bodyStr.includes('ENOENT')) {
-        log.info('Remove got ENOENT from upstream, cleaning ghost cache entry', { filePath });
-        removeFromFileListCache(db, filePath);
-      }
-    }
+  forwardAndTee(req, res, (status) => {
+    log.info('Remove forwarded, cleaning cache entry', { filePath, status: String(status) });
+    removeFromFileListCache(db, filePath);
   });
 }
