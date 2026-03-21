@@ -2,7 +2,8 @@ import http from 'http';
 import Database from 'better-sqlite3';
 import { getCharDetailBlobs } from './db';
 import { decompressColdStorage } from './cold-compat';
-import { forwardRequest } from './proxy';
+import { removeFromFileListCache } from './db';
+import { forwardRequest, forwardAndTee } from './proxy';
 import * as log from './logger';
 
 /**
@@ -77,4 +78,36 @@ export async function handleRemoveAsset(
 
   // Not referenced or error → forward to upstream
   forwardRequest(req, res);
+}
+
+/**
+ * Handle GET /api/remove for non-asset files (e.g. database/dbbackup-*.bin).
+ *
+ * Uses forwardAndTee to inspect the upstream response body.
+ * If upstream returns 500 with ENOENT (file already gone), cleans
+ * the ghost entry from file_list_cache so /api/list stops returning it.
+ *
+ * 2xx success → cache cleaned by the res.on('finish') handler in index.ts.
+ * 500 + ENOENT → cache cleaned here (ghost entry removal).
+ * Other errors → cache untouched (file may still exist).
+ */
+export function handleRemoveFile(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  filePath: string,
+  db: Database.Database,
+): void {
+  forwardAndTee(req, res, (status, body) => {
+    if (status >= 200 && status < 300) {
+      // 2xx: res.on('finish') handler in index.ts handles cache removal
+      return;
+    }
+    if (status === 500) {
+      const bodyStr = body.toString('utf-8');
+      if (bodyStr.includes('ENOENT')) {
+        log.info('Remove got ENOENT from upstream, cleaning ghost cache entry', { filePath });
+        removeFromFileListCache(db, filePath);
+      }
+    }
+  });
 }

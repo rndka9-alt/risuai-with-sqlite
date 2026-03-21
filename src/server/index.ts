@@ -10,7 +10,7 @@ import { slimRemote } from './slim';
 import { decompressColdStorage } from './cold-compat';
 import { writeToUpstream } from './proxy';
 import { handleWriteDatabase, handleWriteRemote } from './write-handler';
-import { handleRemoveAsset } from './remove-handler';
+import { handleRemoveAsset, handleRemoveFile } from './remove-handler';
 import { reconcileDatabaseBin, reconcileRemoteFile } from './reconcile';
 import { handleProxy2, handleGetActiveJobs, handleJobStream, handleJobAbort, handleJobConsume } from './stream-buffer';
 import { getClientJs, injectScriptTag } from './client-bundle';
@@ -51,6 +51,7 @@ type Route =
   | { type: 'root-html' }
   | { type: 'list-files' }
   | { type: 'remove-asset'; filePath: string }
+  | { type: 'remove-file'; filePath: string }
   | { type: 'passthrough' };
 
 function classifyRequest(req: http.IncomingMessage): Route {
@@ -116,11 +117,14 @@ function classifyRequest(req: http.IncomingMessage): Route {
     return { type: 'list-files' };
   }
 
-  // GET /api/remove → asset protection
+  // GET /api/remove → asset protection / file cache sync
   if (url === '/api/remove' && req.method === 'GET') {
     const filePath = decodeFilePath(req);
     if (filePath && filePath.startsWith('assets/')) {
       return { type: 'remove-asset', filePath };
+    }
+    if (filePath) {
+      return { type: 'remove-file', filePath };
     }
   }
 
@@ -950,6 +954,15 @@ function main(): void {
       case 'remove-asset': {
         if (isDbReady()) {
           handleRemoveAsset(req, res, route.filePath, getDb());
+          return;
+        }
+        forwardRequest(req, res);
+        return;
+      }
+
+      case 'remove-file': {
+        if (isDbReady()) {
+          handleRemoveFile(req, res, route.filePath, getDb());
           return;
         }
         forwardRequest(req, res);
