@@ -9,6 +9,7 @@
  */
 
 import { onFileWrite } from './file-list-dataset';
+import { utf8ToHex } from './batch-remotes';
 
 const DEBOUNCE_MS = 100;
 
@@ -32,14 +33,26 @@ function hexToUtf8(hex: string): string {
   return new TextDecoder().decode(bytes);
 }
 
+// hex-encoded prefix for "database/dbbackup-"
+const DBBACKUP_HEX_PREFIX = utf8ToHex('database/dbbackup-');
+
 /**
  * Queue a write. Always returns an immediate synthetic 200.
+ * dbbackup-*.bin writes are dropped (backup is handled server-side).
  */
 export function enqueueWrite(
   hexPath: string,
   init: RequestInit,
   authHeader: string,
 ): Response {
+  // Drop backup writes — server handles backup on database.bin write
+  if (hexPath.startsWith(DBBACKUP_HEX_PREFIX)) {
+    return new Response(JSON.stringify({}), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  }
+
   let bodyBuf: ArrayBuffer;
   if (init.body instanceof ArrayBuffer) {
     bodyBuf = init.body;

@@ -25,11 +25,19 @@ export async function handleWriteDatabase(
 ): Promise<void> {
   const body = await bufferBody(req);
 
+  const authHeader = typeof req.headers[RISU_AUTH_HEADER] === 'string'
+    ? req.headers[RISU_AUTH_HEADER]
+    : undefined;
+
   // Forward to upstream first — response goes to client
   forwardBuffered(req, res, body);
 
-  // Background: parse and update SQLite
+  // Background: server-side backup + parse and update SQLite
   setImmediate(() => {
+    // Backup: server-side copy (클라이언트가 안 보냄)
+    const backupPath = `database/dbbackup-${(Date.now() / 100).toFixed()}.bin`;
+    writeToUpstream(backupPath, body, authHeader);
+
     try {
       const result = parseRisuSave(body);
       if (!result) return;
