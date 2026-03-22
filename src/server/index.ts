@@ -551,6 +551,28 @@ function handleProxyConfig(req: http.IncomingMessage, res: http.ServerResponse):
   proxyReq.end();
 }
 
+// --- Global error handlers ---
+
+process.on('uncaughtException', (err) => {
+  // ECONNRESET / EPIPE from dropped connections — not fatal
+  const code = (err as NodeJS.ErrnoException).code;
+  if (code === 'ECONNRESET' || code === 'EPIPE') {
+    log.warn('Connection reset (uncaughtException)', { code, message: err.message });
+    return;
+  }
+  log.error('Uncaught exception', { error: err.stack ?? String(err) });
+});
+
+process.on('unhandledRejection', (reason) => {
+  const err = reason instanceof Error ? reason : new Error(String(reason));
+  const code = (err as NodeJS.ErrnoException).code;
+  if (code === 'ECONNRESET' || code === 'EPIPE') {
+    log.warn('Connection reset (unhandledRejection)', { code, message: err.message });
+    return;
+  }
+  log.error('Unhandled rejection', { error: err.stack ?? String(err) });
+});
+
 // --- Server ---
 
 const cb = createCircuitBreaker();
@@ -992,6 +1014,18 @@ function main(): void {
         return;
     }
     } // handleRoute
+  });
+
+  server.on('clientError', (err, socket) => {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ECONNRESET' || code === 'EPIPE') {
+      socket.destroy();
+      return;
+    }
+    log.warn('Client error', { code, message: err.message });
+    if (socket.writable) {
+      socket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
+    }
   });
 
   server.listen(PORT, () => {
