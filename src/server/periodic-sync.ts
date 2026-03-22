@@ -15,8 +15,10 @@ import { RisuSaveType } from '../shared/types';
 import * as log from './logger';
 
 const SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
+const REACTIVE_SYNC_COOLDOWN_MS = 60_000; // 1 minute
 
 let timer: ReturnType<typeof setInterval> | null = null;
+let lastReactiveSync = 0;
 
 export function startPeriodicSync(getDb: () => Database.Database): void {
   timer = setInterval(() => {
@@ -184,4 +186,33 @@ async function syncRemotes(
     log.warn('Remote character drift detected', { updated, total: charIds.length });
   }
   return updated;
+}
+
+/**
+ * Trigger file list reconciliation reactively (e.g. on remove 500).
+ *
+ * Debounced to 1 minute to avoid hammering upstream when multiple
+ * stale entries trigger sequential remove failures.
+ */
+export function requestFileListReconciliation(db: Database.Database): void {
+  const now = Date.now();
+  if (now - lastReactiveSync < REACTIVE_SYNC_COOLDOWN_MS) return;
+  lastReactiveSync = now;
+
+  log.info('Reactive file list reconciliation triggered');
+
+  (async () => {
+    if (!isAuthReady()) return;
+    const token = await issueInternalToken();
+    if (!token) return;
+    const drift = await syncFileList(db, token);
+    if (drift.added > 0 || drift.removed > 0) {
+      log.warn('Reactive reconciliation found drift', {
+        added: drift.added,
+        removed: drift.removed,
+      });
+    }
+  })().catch((err) => {
+    log.warn('Reactive file list reconciliation failed', { error: String(err) });
+  });
 }

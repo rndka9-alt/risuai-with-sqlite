@@ -3,7 +3,8 @@ import Database from 'better-sqlite3';
 import { getCharDetailBlobs } from './db';
 import { decompressColdStorage } from './cold-compat';
 import { removeFromFileListCache } from './db';
-import { forwardRequest, forwardAndTee } from './proxy';
+import { forwardAndTee } from './proxy';
+import { requestFileListReconciliation } from './periodic-sync';
 import * as log from './logger';
 
 /**
@@ -77,7 +78,11 @@ export async function handleRemoveAsset(
   }
 
   // Not referenced or error → forward to upstream
-  forwardRequest(req, res);
+  forwardAndTee(req, res, (status) => {
+    if (status >= 400) {
+      requestFileListReconciliation(db);
+    }
+  });
 }
 
 /**
@@ -100,5 +105,8 @@ export function handleRemoveFile(
   forwardAndTee(req, res, (status) => {
     log.info('Remove forwarded, cleaning cache entry', { filePath, status: String(status) });
     removeFromFileListCache(db, filePath);
+    if (status >= 400) {
+      requestFileListReconciliation(db);
+    }
   });
 }
