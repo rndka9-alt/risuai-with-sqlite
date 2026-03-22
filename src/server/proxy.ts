@@ -309,3 +309,47 @@ export function bufferBody(req: http.IncomingMessage): Promise<Buffer> {
     req.on('error', reject);
   });
 }
+
+/**
+ * Write to upstream and return the HTTP status code.
+ * Unlike writeToUpstream (fire-and-forget), this waits for the response.
+ * Used by batch-write handler where we need to know per-entry success/failure.
+ */
+export function writeToUpstreamWithStatus(
+  filePath: string,
+  data: Buffer,
+  authHeader: string | undefined,
+): Promise<number> {
+  return new Promise((resolve) => {
+    const headers: Record<string, string> = {
+      host: UPSTREAM.host,
+      [FILE_PATH_HEADER]: encodeFilePath(filePath),
+      'content-type': 'application/octet-stream',
+      'content-length': String(data.length),
+    };
+    if (authHeader) {
+      headers[RISU_AUTH_HEADER] = authHeader;
+    }
+
+    const proxyReq = http.request(
+      {
+        hostname: UPSTREAM.hostname,
+        port: UPSTREAM.port,
+        path: '/api/write',
+        method: 'POST',
+        headers,
+      },
+      (proxyRes) => {
+        proxyRes.resume();
+        resolve(proxyRes.statusCode ?? 502);
+      },
+    );
+
+    proxyReq.end(data);
+
+    proxyReq.on('error', (err) => {
+      log.warn('writeToUpstreamWithStatus error', { filePath, error: err.message });
+      resolve(502);
+    });
+  });
+}

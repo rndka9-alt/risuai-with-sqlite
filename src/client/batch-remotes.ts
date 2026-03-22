@@ -6,7 +6,7 @@
  * remote files are then served from this prefetched cache.
  */
 
-function utf8ToHex(str: string): string {
+export function utf8ToHex(str: string): string {
   const bytes = new TextEncoder().encode(str);
   let hex = '';
   for (const b of bytes) hex += b.toString(16).padStart(2, '0');

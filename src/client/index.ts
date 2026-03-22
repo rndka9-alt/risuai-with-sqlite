@@ -4,6 +4,7 @@
  */
 
 import { installBatchRemotes } from './batch-remotes';
+import { installBatchWrite } from './batch-write';
 import { installFileListDataset } from './file-list-dataset';
 import { install as installFetchPatch } from './fetch-patch';
 import { recoverJobs } from './recovery';
@@ -16,7 +17,10 @@ installBatchRemotes();
 // Fetch file-list dataset (before fetch patch so it uses original fetch)
 installFileListDataset();
 
-// Patch fetch to add target character header + batch intercept + file-list cache
+// Store reference to real fetch for batch-write replay (before patch)
+installBatchWrite(window.fetch);
+
+// Patch fetch to add target character header + batch intercept + file-list cache + batch write
 installFetchPatch();
 
 // Background: load stripped character detail fields

@@ -4,10 +4,12 @@
  * 2. Add x-dbproxy-target-char header to POST /proxy2 requests
  * 3. Capture x-dbproxy-job-id from response headers
  * 4. Serve remote file reads from batch cache when available
+ * 5. Coalesce remote file writes into batches (batch-write)
  */
 
-import { tryServeBatchRemote } from './batch-remotes';
-import { tryServeFileList, tryServeMetaRead, onFileWrite, onFileRemove } from './file-list-dataset';
+import { tryServeBatchRemote, utf8ToHex } from './batch-remotes';
+import { enqueueWrite } from './batch-write';
+import { tryServeFileList, tryServeMetaRead, onFileRemove } from './file-list-dataset';
 import { getPluginApis } from '../utils/getPluginApis';
 
 /** Track the most recent job ID from proxy2 responses */
@@ -61,7 +63,7 @@ function getHeader(headers: HeadersInit | undefined, key: string): string | null
 }
 
 // hex-encoded prefix for "remotes/"
-const REMOTES_HEX_PREFIX = '72656d6f7465732f';
+const REMOTES_HEX_PREFIX = utf8ToHex('remotes/');
 
 function hexToUtf8(hex: string): string {
   const bytes = new Uint8Array(hex.length / 2);
@@ -147,14 +149,11 @@ const patchedFetch: typeof fetch = function (input, init) {
     }
   }
 
-  // Track write/remove to keep file-list dataset in sync
+  // Intercept ALL POST /api/write → queue and batch (onFileWrite called by batch-write on success)
   if (input === '/api/write' && init?.method === 'POST') {
     const filePath = getHeader(init?.headers, 'file-path');
     if (filePath) {
-      return originalFetch.call(window, input, init).then((resp) => {
-        if (resp.ok) onFileWrite(hexToUtf8(filePath));
-        return resp;
-      });
+      return Promise.resolve(enqueueWrite(filePath, init, cachedAuth ?? ''));
     }
   }
 
