@@ -10,7 +10,6 @@ import { slimRemote } from './slim';
 import { decompressColdStorage } from './cold-compat';
 import { writeToUpstream } from './proxy';
 import { handleWriteDatabase, handleWriteRemote } from './write-handler';
-import { handleBatchWrite } from './batch-write-handler';
 import { handleRemoveAsset, handleRemoveFile } from './remove-handler';
 import { reconcileDatabaseBin, reconcileRemoteFile } from './reconcile';
 import { handleProxy2, handleGetActiveJobs, handleJobStream, handleJobAbort, handleJobConsume } from './stream-buffer';
@@ -47,7 +46,6 @@ type Route =
   | { type: 'db-char-detail'; charId: string }
   | { type: 'db-char-details' }
   | { type: 'db-batch-remotes' }
-  | { type: 'db-batch-write' }
   | { type: 'db-file-list-dataset' }
   | { type: 'proxy-config' }
   | { type: 'root-html' }
@@ -88,11 +86,6 @@ function classifyRequest(req: http.IncomingMessage): Route {
   // Batch remotes endpoint
   if (url === '/db/batch-remotes' && req.method === 'GET') {
     return { type: 'db-batch-remotes' };
-  }
-
-  // Batch write endpoint
-  if (url === '/db/batch-write' && req.method === 'POST') {
-    return { type: 'db-batch-write' };
   }
 
   // Char detail endpoints
@@ -808,16 +801,6 @@ function main(): void {
           'cache-control': 'no-cache',
         });
         res.end(buf);
-        return;
-      }
-
-      case 'db-batch-write': {
-        if (!isDbReady()) {
-          res.writeHead(503, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({ error: 'DB not ready' }));
-          return;
-        }
-        handleBatchWrite(req, res, getDb());
         return;
       }
 

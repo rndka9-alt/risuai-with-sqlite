@@ -4,11 +4,9 @@
  * 2. Add x-dbproxy-target-char header to POST /proxy2 requests
  * 3. Capture x-dbproxy-job-id from response headers
  * 4. Serve remote file reads from batch cache when available
- * 5. Coalesce remote file writes into batches (batch-write)
  */
 
 import { tryServeBatchRemote, utf8ToHex } from './batch-remotes';
-import { enqueueWrite } from './batch-write';
 import { tryServeFileList, tryServeMetaRead, onFileRemove } from './file-list-dataset';
 import { getPluginApis } from '../utils/getPluginApis';
 
@@ -146,14 +144,6 @@ const patchedFetch: typeof fetch = function (input, init) {
           resp ?? originalFetch.call(window, input, init)
         );
       }
-    }
-  }
-
-  // Intercept ALL POST /api/write → queue and batch (onFileWrite called by batch-write on success)
-  if (input === '/api/write' && init?.method === 'POST') {
-    const filePath = getHeader(init?.headers, 'file-path');
-    if (filePath) {
-      return Promise.resolve(enqueueWrite(filePath, init, cachedAuth ?? ''));
     }
   }
 
