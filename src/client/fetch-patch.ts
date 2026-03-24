@@ -81,9 +81,21 @@ function setHeader(headers: HeadersInit, key: string, value: string): void {
   }
 }
 
+/** 클라이언트 rid 생성: 체인 전체에서 동일 요청 추적용 */
+function generateRid(): string {
+  const ts = Date.now().toString(36);
+  const rand = Math.random().toString(36).substring(2, 8);
+  return `${ts}-${rand}`;
+}
+
 const originalFetch = window.fetch;
 
 const patchedFetch: typeof fetch = function (input, init) {
+  // 모든 요청에 x-request-id 주입 (없을 때만)
+  if (init?.headers && !getHeader(init.headers, 'x-request-id')) {
+    setHeader(init.headers, 'x-request-id', generateRid());
+  }
+
   // Capture risu-auth from /api/* requests
   if (typeof input === 'string' && input.startsWith('/api/')) {
     const auth = getHeader(init?.headers, 'risu-auth');
