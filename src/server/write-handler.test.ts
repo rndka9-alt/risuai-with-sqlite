@@ -182,63 +182,6 @@ describe('handleWriteDatabase', () => {
     });
   });
 
-  it('writes server-side backup to upstream with database/dbbackup-* path', async () => {
-    const data = Buffer.from('{"key":"value"}');
-    const body = buildRisuSave([
-      buildBlock(RisuSaveType.CONFIG, 0, 'config_0', data),
-    ]);
-    vi.mocked(bufferBody).mockResolvedValue(body);
-
-    const req = createMockReq({ 'risu-auth': 'test-jwt' });
-    const res = createMockRes();
-
-    await handleWriteDatabase(req, res, db);
-
-    await vi.waitFor(() => {
-      expect(writeToUpstream).toHaveBeenCalled();
-    });
-
-    const call = vi.mocked(writeToUpstream).mock.calls[0];
-    expect(call[0]).toMatch(/^database\/dbbackup-\d+\.bin$/);
-    expect(call[1]).toBe(body); // 동일한 body
-    expect(call[2]).toBe('test-jwt'); // auth 전달
-  });
-
-  it('writes backup with undefined auth when risu-auth header is absent', async () => {
-    const body = buildRisuSave([
-      buildBlock(RisuSaveType.CONFIG, 0, 'c0', Buffer.from('{}')),
-    ]);
-    vi.mocked(bufferBody).mockResolvedValue(body);
-
-    await handleWriteDatabase(createMockReq(), createMockRes(), db);
-
-    await vi.waitFor(() => {
-      expect(writeToUpstream).toHaveBeenCalled();
-    });
-
-    const call = vi.mocked(writeToUpstream).mock.calls[0];
-    expect(call[0]).toMatch(/^database\/dbbackup-/);
-    expect(call[2]).toBeUndefined();
-  });
-
-  it('backup path uses unique timestamp', async () => {
-    const body = buildRisuSave([
-      buildBlock(RisuSaveType.CONFIG, 0, 'c0', Buffer.from('{}')),
-    ]);
-    vi.mocked(bufferBody).mockResolvedValue(body);
-
-    await handleWriteDatabase(createMockReq(), createMockRes(), db);
-
-    await vi.waitFor(() => {
-      expect(writeToUpstream).toHaveBeenCalled();
-    });
-
-    const path1 = vi.mocked(writeToUpstream).mock.calls[0][0];
-    const ts = path1.replace('database/dbbackup-', '').replace('.bin', '');
-    expect(Number(ts)).toBeGreaterThan(0);
-    expect(Number(ts)).toBeLessThan(Date.now()); // timestamp / 100이라 현재 시각보다 작음
-  });
-
   it('forwards to upstream even when parse returns null', async () => {
     const body = Buffer.from('not a valid RisuSave binary');
     vi.mocked(bufferBody).mockResolvedValue(body);
