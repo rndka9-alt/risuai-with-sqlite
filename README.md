@@ -105,7 +105,7 @@ Client → DB-Proxy
 
 ```
 Proactive Hydration (서버 시작 즉시):
-1. SQLite 초기화 (blocks/chats/char_details/jobs 초기화, file_list_cache는 유지)
+1. SQLite 초기화 (blocks/chats/char_details/jobs/file_list_cache 모두 초기화)
 2. Self-auth: ES256 키페어 생성 → risuai /api/login으로 등록 (__password 파일 사용)
 3. API 기반 hydration:
    a. GET /api/list → file_list_cache 적재
@@ -154,7 +154,7 @@ Client POST /api/write
 
 `__strippedFields` merge는 클라이언트가 detail을 아직 로딩하지 않은 상태에서 저장해도 데이터 유실이 없도록 보장한다.
 
-### Remove Path (에셋 보호)
+### Remove Path (에셋 보호 + 캐시 정합성)
 
 ```
 Client GET /api/remove
@@ -162,8 +162,12 @@ Client GET /api/remove
 │   1. char_details에서 에셋 참조 검색
 │   2. 참조 있음 → 차단 (200 OK 반환, upstream 안 보냄)
 │   3. 참조 없음 → upstream forward (진짜 고아 에셋)
-│   4. 검색 에러 → upstream fallback (P1: 투명성)
-└─ 기타 → upstream 패스스루
+│   4. upstream 400+ → file_list_cache reconciliation 요청
+│   5. 검색 에러 → upstream fallback (P1: 투명성)
+└─ 기타 (backup 등):
+    1. upstream forward
+    2. file_list_cache에서 해당 경로 제거
+    3. upstream 400+ → file_list_cache reconciliation 요청
 ```
 
 Deep Slim이 `emotionImages`, `additionalAssets`, `ccAssets`를 빈 배열로 치환하므로,
@@ -195,7 +199,7 @@ risuai의 ES256 JWT 인증을 공유한다. 별도 인증 시스템 없음.
 **클라이언트 인증**:
 - `/db/*` 데이터 엔드포인트에 `risu-auth` 헤더 필수
 - risuai의 `/api/test_auth`에 위임하여 검증
-- `db-client-js`는 인증 불필요 (스크립트 파일)
+- `db-client-js`, `db-batch-remotes`, `db-file-list-dataset`는 인증 불필요 (읽기 전용·캐시 워밍용)
 
 ### Streaming (proxy2)
 
@@ -321,7 +325,7 @@ CREATE INDEX idx_blocks_source ON blocks(source);
 CREATE INDEX idx_chats_char ON chats(char_id);
 ```
 
-`file_list_cache`는 서버 재시작 시 초기화되지 않는다 (캐시 특성상 stale해도 무해).
+`file_list_cache`는 서버 재시작 시 다른 테이블과 함께 초기화되며, proactive hydration에서 upstream `/api/list`로 재적재된다.
 
 ## 모듈 구조
 
@@ -355,9 +359,11 @@ src/
 │   ├── periodic-sync.ts      # 24시간 주기 upstream 정합성 검증 + drift 보정
 │   ├── stream-buffer.ts      # /proxy2 SSE 스트리밍 + job 관리
 │   ├── client-bundle.ts      # client.js 로딩 + HTML script 주입
+│   ├── dbMigrate.ts          # DB 스키마 마이그레이션 (last_used 컬럼 추가 등)
 │   ├── parser.test.ts        # parser 테스트
 │   ├── slim.test.ts          # slim/deepSlim/merge 테스트
-│   └── write-handler.test.ts # write handler 테스트
+│   ├── write-handler.test.ts # write handler 테스트
+│   └── remove-handler.test.ts # remove handler 테스트
 ├── shared/
 │   └── types.ts              # RisuSaveType enum, ParsedBlock, Job 등 공유 타입
 ├── types/
@@ -405,7 +411,7 @@ npm run test:watch   # vitest watch 모드
 npm run typecheck    # tsc --noEmit
 ```
 
-테스트 파일은 소스 옆에 co-locate한다 (`slim.ts` → `slim.test.ts`).
+테스트 파일은 소스 옆에 co-locate한다 (`slim.ts` → `slim.test.ts`, `remove-handler.ts` → `remove-handler.test.ts`).
 
 ## Docker
 
