@@ -3,12 +3,27 @@ import http from 'http';
 import { PORT, UPSTREAM, CLIENT_ID_HEADER, REQUEST_ID_HEADER, RISU_AUTH_HEADER, FILE_PATH_HEADER, AUTH_EXEMPT_ROUTES } from './config';
 import { forwardRequest, forwardAndTee, forwardBufferAndTransform, decodeFilePath, fetchFromUpstream } from './proxy';
 import { createCircuitBreaker } from './circuit-breaker';
-import { initDb, resetDb, isDbReady, getDb, getBlock, getBlocksBySource, getAllRemoteBlocks, upsertBlock, upsertChat, upsertCharDetail, getCharDetail, getAllCharDetails, getChat, inTransaction, populateFileListCache, getFileListCache, isFileListCacheReady, addToFileListCache, removeFromFileListCache, upsertMetaLastUsed, getMetaEntries, getMetaMissingLastUsed } from './db';
+import {
+  initDb, isDbReady, getDb, generateId,
+  getBlockByName, getBlocksBySource, upsertBlock,
+  getCharacterByCharId, getAllCharacterIds, upsertCharacter,
+  characterJsonToColumns, characterColumnsToJson,
+  getChatSessionByUuid, getChatSessionsByCharacter,
+  getChatMessagesBySession, upsertChatSession, insertChatMessages,
+  softDeleteChatSessionsByCharacter, softDeleteChatMessagesBySession,
+  getAssetByHash, linkCharacterAsset, softDeleteAssetMapByCharacter,
+  getAssetMapByCharacter,
+  softDeleteStaleCharacters, inTransaction,
+  populateFileListCache, getFileListCache, isFileListCacheReady,
+  addToFileListCache, removeFromFileListCache,
+  upsertMetaLastUsed, getMetaEntries, getMetaMissingLastUsed,
+  blockCount,
+} from './db';
 
 import { parseRisuSave, parseRemoteFile, parseRemotePointer } from './parser';
 import { assembleRisuSave } from './assembler';
-import { slimRemote } from './slim';
-import { decompressColdStorage } from './cold-compat';
+import { HEAVY_FIELDS, COLD_STORAGE_HEADER, isColdMarker } from './slim';
+import { compressColdStorage } from './cold-compat';
 import { writeToUpstream } from './proxy';
 import { handleWriteDatabase, handleWriteRemote } from './write-handler';
 import { handleRemoveAsset, handleRemoveFile } from './remove-handler';
@@ -144,26 +159,104 @@ const pendingBatchRequests: Array<{ res: http.ServerResponse; timer: ReturnType<
 
 const BATCH_WAIT_TIMEOUT_MS = 30_000;
 
-function serializeBatchRemotes(remotes: Array<{ name: string; data: Buffer }>): Buffer {
+/** characters 테이블에서 slim JSON을 만들어 batch-remotes 바이너리로 직렬화 */
+function serializeBatchRemotesFromDb(db: import('better-sqlite3').Database): Buffer {
+  const charRows = getAllCharacterIds(db);
+  const entries: Array<{ charId: string; data: Buffer }> = [];
+
+  for (const row of charRows) {
+    if (!row.char_id) continue;
+    const charRow = getCharacterByCharId(db, row.char_id);
+    if (!charRow) continue;
+    const slimJson = buildSlimJson(charRow);
+    entries.push({ charId: row.char_id, data: Buffer.from(slimJson, 'utf-8') });
+  }
+
   let totalSize = 4;
-  for (const r of remotes) {
-    const charId = r.name.slice(7); // strip 'remote:'
-    totalSize += 1 + Buffer.byteLength(charId) + 4 + r.data.length;
+  for (const e of entries) {
+    totalSize += 1 + Buffer.byteLength(e.charId) + 4 + e.data.length;
   }
 
   const buf = Buffer.alloc(totalSize);
   let off = 0;
-  buf.writeUInt32LE(remotes.length, off); off += 4;
-  for (const r of remotes) {
-    const charId = r.name.slice(7);
-    const charIdBuf = Buffer.from(charId, 'utf-8');
+  buf.writeUInt32LE(entries.length, off); off += 4;
+  for (const e of entries) {
+    const charIdBuf = Buffer.from(e.charId, 'utf-8');
     buf[off++] = charIdBuf.length;
     charIdBuf.copy(buf, off); off += charIdBuf.length;
-    buf.writeUInt32LE(r.data.length, off); off += 4;
-    r.data.copy(buf, off); off += r.data.length;
+    buf.writeUInt32LE(e.data.length, off); off += 4;
+    e.data.copy(buf, off); off += e.data.length;
   }
 
   return buf;
+}
+
+/** characters row → 클라이언트용 slim JSON (heavy 필드 제외 + __strippedFields 마커) */
+function buildSlimJson(row: Record<string, unknown>): string {
+  const json = characterColumnsToJson(row);
+
+  // heavy 필드를 빈 값으로 대체 + __strippedFields 마커
+  const strippedFields: string[] = [];
+  for (const field of HEAVY_FIELDS) {
+    if (field in json) {
+      strippedFields.push(field);
+      const val = json[field];
+      if (typeof val === 'string') json[field] = '';
+      else if (Array.isArray(val)) json[field] = [];
+      else if (typeof val === 'object' && val !== null) json[field] = {};
+    }
+  }
+  if (strippedFields.length > 0) {
+    json.__strippedFields = strippedFields;
+  }
+
+  // 에셋 참조 복원 (slim에는 image만 포함, emotion/additional/cc는 heavy)
+  // image는 character_asset_map에서 복원
+  const db = getDb();
+  const wsId = row.__ws_id;
+  if (typeof wsId === 'string') {
+    const assetMap = getAssetMapByCharacter(db, wsId);
+    for (const m of assetMap) {
+      if (m.field === 'image' && m.__ws_asset_id) {
+        const asset = getAssetByHash(db, ''); // need by id
+        // image 경로는 source_file에서 복원
+      }
+    }
+    // image 복원: asset_map에서 field='image' 찾아서 경로 설정
+    const imageMap = assetMap.find((m) => m.field === 'image');
+    if (imageMap && imageMap.__ws_asset_id) {
+      const asset = db.prepare('SELECT hash, __ws_source_file FROM assets WHERE __ws_id = ?').get(imageMap.__ws_asset_id) as { hash: string; __ws_source_file: string } | undefined;
+      if (asset) {
+        json.image = asset.__ws_source_file || `assets/${asset.hash}.png`;
+      }
+    }
+  }
+
+  // chats 배열은 cold marker로 재구성
+  if (typeof wsId === 'string') {
+    const sessions = getChatSessionsByCharacter(db, wsId);
+    json.chats = sessions.map((s) => ({
+      message: s.uuid
+        ? [{ role: 'char', data: COLD_STORAGE_HEADER + s.uuid, time: Date.now() }]
+        : [],
+      hypaV2Data: tryParse(s.hypa_v2),
+      hypaV3Data: tryParse(s.hypa_v3),
+      scriptstate: tryParse(s.script_state),
+      localLore: tryParse(s.local_lore),
+      folderId: s.folder_id,
+      lastDate: s.last_date,
+      fmIndex: s.fm_index,
+      bookmarks: tryParse(s.bookmarks),
+      bookmarkNames: tryParse(s.bookmark_names),
+    }));
+  }
+
+  return JSON.stringify(json);
+}
+
+function tryParse(val: unknown): unknown {
+  if (typeof val !== 'string') return val ?? {};
+  try { return JSON.parse(val); } catch { return val; }
 }
 
 /**
@@ -185,10 +278,9 @@ function flushPendingBatchRequests(): void {
   if (!isDbReady()) return;
 
   const db = getDb();
-  const remotes = getAllRemoteBlocks(db);
-  const buf = serializeBatchRemotes(remotes);
+  const buf = serializeBatchRemotesFromDb(db);
 
-  log.info('Flushing pending batch-remotes', { count: String(pendingBatchRequests.length), remotes: String(remotes.length) });
+  log.info('Flushing pending batch-remotes', { count: String(pendingBatchRequests.length) });
 
   for (const pending of pendingBatchRequests) {
     clearTimeout(pending.timer);
@@ -262,7 +354,8 @@ function captureDatabaseBin(body: Buffer, authHeader: string | undefined): void 
 
   inTransaction(db, () => {
     for (const block of result.blocks) {
-      upsertBlock(db, block.name, block.type, 'database.bin', block.compression, block.data, block.hash);
+      const dataStr = block.data.toString('utf-8');
+      upsertBlock(db, generateId(db), block.name, block.type, 'database.bin', dataStr, block.hash);
       if (block.type === RisuSaveType.REMOTE) {
         const ptr = parseRemotePointer(block.data);
         if (ptr) {
@@ -295,40 +388,126 @@ async function captureRemoteFile(body: Buffer, charId: string, authHeader: strin
   const db = getDb();
   const t0 = performance.now();
 
-  const block = parseRemoteFile(body, charId);
-  if (!block) return;
+  const charJsonStr = body.toString('utf-8');
+  let charObj: Record<string, unknown>;
+  try { charObj = JSON.parse(charJsonStr); } catch { return; }
 
-  const charJson = block.data.toString('utf-8');
-  const t1 = performance.now();
+  const hash = crypto.createHash('sha256').update(charJsonStr).digest('hex');
+  const existing = getCharacterByCharId(db, charId);
+  const wsId = existing?.__ws_id ?? generateId(db);
 
-  const slimmed = await slimRemote(charJson, charId);
-  const t2 = performance.now();
-
-  inTransaction(db, () => {
-    upsertBlock(db, `remote:${charId}`, RisuSaveType.CHARACTER_WITH_CHAT, `remote:${charId}`, 0, slimmed.deepSlimBuffer, block.hash);
-    upsertCharDetail(db, charId, slimmed.detailCompressed, slimmed.detailHash);
-    for (const entry of slimmed.coldEntries) {
-      upsertChat(db, entry.uuid, entry.charId, entry.chatIndex, entry.compressed, entry.hash);
-    }
-  });
-  const t3 = performance.now();
-
-  for (const entry of slimmed.coldEntries) {
-    writeToUpstream(`coldstorage/${entry.uuid}`, entry.compressed, authHeader);
+  const { columns, unknownFields } = characterJsonToColumns(charObj);
+  if (unknownFields.length > 0) {
+    log.warn('Hydration: unknown character fields', { charId, fields: unknownFields.join(', ') });
   }
 
+  const t1 = performance.now();
+
+  inTransaction(db, () => {
+    upsertCharacter(db, wsId, charId, hash, `remotes/${charId}.local.bin`, columns);
+    softDeleteAssetMapByCharacter(db, wsId);
+    // 에셋 메타 등록 (inline)
+    if (typeof charObj.image === 'string' && charObj.image) {
+      const aid = ensureAssetMeta(db, charObj.image);
+      if (aid) linkCharacterAsset(db, wsId, aid, 'image', null, null, null, 0);
+    }
+    if (Array.isArray(charObj.emotionImages)) {
+      for (let i = 0; i < charObj.emotionImages.length; i++) {
+        const e = charObj.emotionImages[i];
+        if (!Array.isArray(e) || e.length < 2) continue;
+        const aid = ensureAssetMeta(db, e[1]);
+        if (aid) linkCharacterAsset(db, wsId, aid, 'emotionImages', e[0], null, null, i);
+      }
+    }
+    if (Array.isArray(charObj.additionalAssets)) {
+      for (let i = 0; i < charObj.additionalAssets.length; i++) {
+        const e = charObj.additionalAssets[i];
+        if (!Array.isArray(e) || e.length < 2) continue;
+        const aid = ensureAssetMeta(db, e[1]);
+        if (aid) linkCharacterAsset(db, wsId, aid, 'additionalAssets', e[0], e[2] ?? null, null, i);
+      }
+    }
+    if (Array.isArray(charObj.ccAssets)) {
+      for (let i = 0; i < charObj.ccAssets.length; i++) {
+        const e = charObj.ccAssets[i] as Record<string, string> | undefined;
+        if (!e?.uri) continue;
+        const aid = ensureAssetMeta(db, e.uri);
+        if (aid) linkCharacterAsset(db, wsId, aid, 'ccAssets', e.name ?? null, e.ext ?? null, e.type ?? null, i);
+      }
+    }
+
+    // 채팅 정규화
+    storeChatsDuringHydration(db, wsId, charObj.chats, authHeader);
+  });
+
+  const t2 = performance.now();
+
   capturedRemotes.add(charId);
-  log.info('captureRemoteFile timing', {
+  log.info('captureRemoteFile', {
     charId,
     bodyKB: String((body.length / 1024).toFixed(0)),
-    coldEntries: String(slimmed.coldEntries.length),
     parse: (t1 - t0).toFixed(0) + 'ms',
-    slim: (t2 - t1).toFixed(0) + 'ms',
-    sqlite: (t3 - t2).toFixed(0) + 'ms',
-    total: (t3 - t0).toFixed(0) + 'ms',
+    sqlite: (t2 - t1).toFixed(0) + 'ms',
     captured: capturedRemotes.size + '/' + expectedRemoteCount,
   });
   hydrationState = resolveHydration();
+}
+
+function ensureAssetMeta(db: import('better-sqlite3').Database, assetPath: string): string | null {
+  const match = assetPath.match(/^assets\/([^.]+)/);
+  if (!match) return null;
+  const hash = match[1];
+  const existing = getAssetByHash(db, hash);
+  if (existing) return existing.__ws_id;
+  const wsId = generateId(db);
+  const ext = assetPath.split('.').pop() ?? '';
+  const mimeType = ext === 'png' ? 'image/png' : ext === 'webp' ? 'image/webp' : ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg' : null;
+  db.prepare('INSERT INTO assets (__ws_id, hash, mime_type, __ws_source_file) VALUES (?, ?, ?, ?)').run(wsId, hash, mimeType, assetPath);
+  return wsId;
+}
+
+function storeChatsDuringHydration(
+  db: import('better-sqlite3').Database,
+  characterWsId: string,
+  chats: unknown,
+  authHeader: string | undefined,
+): void {
+  if (!Array.isArray(chats)) return;
+
+  for (let i = 0; i < chats.length; i++) {
+    const chat = chats[i];
+    if (!chat || typeof chat !== 'object') continue;
+    const sessionWsId = generateId(db);
+    const sessionFields = {
+      hypa_v2: JSON.stringify(chat.hypaV2Data ?? {}),
+      hypa_v3: JSON.stringify(chat.hypaV3Data ?? {}),
+      script_state: JSON.stringify(chat.scriptstate ?? {}),
+      local_lore: JSON.stringify(chat.localLore ?? []),
+      folder_id: chat.folderId ?? null,
+      last_date: chat.lastDate ?? null,
+      fm_index: chat.fmIndex ?? null,
+      bookmarks: JSON.stringify(chat.bookmarks ?? []),
+      bookmark_names: JSON.stringify(chat.bookmarkNames ?? {}),
+    };
+
+    if (isColdMarker(chat)) {
+      const markerData = chat.message?.[0]?.data ?? '';
+      const uuid = markerData.startsWith(COLD_STORAGE_HEADER) ? markerData.slice(COLD_STORAGE_HEADER.length) : null;
+      upsertChatSession(db, sessionWsId, characterWsId, uuid, i, sessionFields, null, uuid ? `coldstorage/${uuid}` : null);
+      continue;
+    }
+
+    const messages: Array<Record<string, unknown>> = Array.isArray(chat.message) ? chat.message : [];
+    let uuid: string | null = null;
+    if (messages.length > 0) {
+      uuid = crypto.randomUUID();
+      const coldPayload = JSON.stringify({ message: chat.message, hypaV2Data: chat.hypaV2Data, hypaV3Data: chat.hypaV3Data, scriptstate: chat.scriptstate, localLore: chat.localLore });
+      compressColdStorage(coldPayload).then((compressed) => writeToUpstream(`coldstorage/${uuid}`, compressed, authHeader)).catch(() => {});
+    }
+    const hash = messages.length > 0 ? crypto.createHash('sha256').update(JSON.stringify(messages)).digest('hex') : null;
+    upsertChatSession(db, sessionWsId, characterWsId, uuid, i, sessionFields, hash, uuid ? `coldstorage/${uuid}` : null);
+    if (messages.length > 0) insertChatMessages(db, sessionWsId, messages);
+  }
 }
 
 // --- Read handlers ---
@@ -340,10 +519,10 @@ function handleReadDatabase(req: http.IncomingMessage, res: http.ServerResponse)
 
   const binary = assembleRisuSave(
     rows.map((r) => ({
-      name: r.name,
-      type: toRisuSaveType(r.type) ?? RisuSaveType.CONFIG,
-      data: r.data,
-      compress: r.compression === 1,
+      name: r.name ?? '',
+      type: toRisuSaveType(r.type ?? 0) ?? RisuSaveType.CONFIG,
+      data: Buffer.from(r.data ?? '', 'utf-8'),
+      compress: true,
     })),
   );
 
@@ -353,60 +532,97 @@ function handleReadDatabase(req: http.IncomingMessage, res: http.ServerResponse)
 
 function handleReadRemote(req: http.IncomingMessage, res: http.ServerResponse, charId: string): void {
   const db = getDb();
-  const block = getBlock(db, `remote:${charId}`);
-  if (!block) throw new Error(`Remote ${charId} not in cache`);
+  const charRow = getCharacterByCharId(db, charId);
+  if (!charRow) throw new Error(`Remote ${charId} not in cache`);
 
-  res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': String(block.data.length) });
-  res.end(block.data);
+  const slimJson = buildSlimJson(charRow);
+  const buf = Buffer.from(slimJson, 'utf-8');
+  res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': String(buf.length) });
+  res.end(buf);
 }
 
-function handleReadColdStorage(req: http.IncomingMessage, res: http.ServerResponse, key: string): void {
+async function handleReadColdStorage(req: http.IncomingMessage, res: http.ServerResponse, key: string): Promise<void> {
   const db = getDb();
-  const chat = getChat(db, key);
-  if (!chat) throw new Error(`Cold storage ${key} not in cache`);
+  const session = getChatSessionByUuid(db, key);
+  if (!session) throw new Error(`Cold storage ${key} not in cache`);
 
-  res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': String(chat.data.length) });
-  res.end(chat.data);
+  // chat_messages에서 메시지 복원 → cold storage JSON 재구성 → gzip 압축
+  const messages = getChatMessagesBySession(db, session.__ws_id);
+  const coldPayload = JSON.stringify({
+    message: messages.map((m) => ({
+      role: m.role,
+      data: m.data,
+      chatId: m.chat_id,
+      saying: m.saying,
+      name: m.name,
+      time: m.time,
+      disabled: m.disabled === 'true' ? true : m.disabled === 'false' ? false : m.disabled === 'allBefore' ? 'allBefore' : undefined,
+      isComment: m.is_comment === 1 ? true : undefined,
+      otherUser: m.other_user === 1 ? true : undefined,
+      generationInfo: tryParse(m.generation_info),
+      promptInfo: tryParse(m.prompt_info),
+    })),
+    hypaV2Data: tryParse(session.hypa_v2),
+    hypaV3Data: tryParse(session.hypa_v3),
+    scriptstate: tryParse(session.script_state),
+    localLore: tryParse(session.local_lore),
+  });
+
+  // RisuAI 클라이언트는 fflate.decompress()로 읽으므로 gzip 필수
+  const compressed = await compressColdStorage(coldPayload);
+  res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': String(compressed.length) });
+  res.end(compressed);
 }
 
 // --- Char detail handlers ---
 
-async function handleGetCharDetail(req: http.IncomingMessage, res: http.ServerResponse, charId: string): Promise<void> {
+function handleGetCharDetail(req: http.IncomingMessage, res: http.ServerResponse, charId: string): void {
   const db = getDb();
-  const row = getCharDetail(db, charId);
+  const row = getCharacterByCharId(db, charId);
   if (!row) {
     res.writeHead(404, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ error: 'Not found' }));
     return;
   }
 
-  const json = await decompressColdStorage(row.data);
+  // heavy 필드만 추출
+  const fullJson = characterColumnsToJson(row);
+  const detail: Record<string, unknown> = {};
+  for (const field of HEAVY_FIELDS) {
+    if (field in fullJson) detail[field] = fullJson[field];
+  }
+
+  // 에셋 참조 복원 (emotionImages, additionalAssets, ccAssets)
+  const assetMap = getAssetMapByCharacter(db, row.__ws_id);
+  reconstructAssetFields(db, detail, assetMap);
+
+  const body = JSON.stringify(detail);
   res.writeHead(200, {
     'content-type': 'application/json',
-    'content-length': String(Buffer.byteLength(json)),
+    'content-length': String(Buffer.byteLength(body)),
     'cache-control': 'no-cache',
   });
-  res.end(json);
+  res.end(body);
 }
 
-async function handleGetAllCharDetails(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+function handleGetAllCharDetails(req: http.IncomingMessage, res: http.ServerResponse): void {
   const db = getDb();
-  const rows = getAllCharDetails(db);
-
-  const entries = await Promise.all(
-    rows.map(async (row) => {
-      try {
-        const json = await decompressColdStorage(row.data);
-        return [row.charId, JSON.parse(json)] as const;
-      } catch {
-        return null;
-      }
-    }),
-  );
+  const charRows = getAllCharacterIds(db);
 
   const result: Record<string, unknown> = {};
-  for (const entry of entries) {
-    if (entry) result[entry[0]] = entry[1];
+  for (const { __ws_id, char_id } of charRows) {
+    if (!char_id) continue;
+    const row = getCharacterByCharId(db, char_id);
+    if (!row) continue;
+
+    const fullJson = characterColumnsToJson(row);
+    const detail: Record<string, unknown> = {};
+    for (const field of HEAVY_FIELDS) {
+      if (field in fullJson) detail[field] = fullJson[field];
+    }
+    const assetMap = getAssetMapByCharacter(db, __ws_id);
+    reconstructAssetFields(db, detail, assetMap);
+    result[char_id] = detail;
   }
 
   const body = JSON.stringify(result);
@@ -416,6 +632,36 @@ async function handleGetAllCharDetails(req: http.IncomingMessage, res: http.Serv
     'cache-control': 'no-cache',
   });
   res.end(body);
+}
+
+/** character_asset_map → RisuAI 에셋 필드 복원 */
+function reconstructAssetFields(
+  db: import('better-sqlite3').Database,
+  json: Record<string, unknown>,
+  assetMap: Array<{ field: string | null; label: string | null; ext: string | null; cc_type: string | null; __ws_asset_id: string | null; __ws_order: number | null }>,
+): void {
+  const emotions: Array<[string, string]> = [];
+  const additional: Array<[string, string, string]> = [];
+  const cc: Array<{ type: string; uri: string; name: string; ext: string }> = [];
+
+  for (const m of assetMap) {
+    if (!m.__ws_asset_id || !m.field) continue;
+    const asset = db.prepare('SELECT hash, __ws_source_file FROM assets WHERE __ws_id = ?').get(m.__ws_asset_id) as { hash: string; __ws_source_file: string | null } | undefined;
+    if (!asset) continue;
+    const assetPath = asset.__ws_source_file || `assets/${asset.hash}.png`;
+
+    if (m.field === 'emotionImages') {
+      emotions.push([m.label ?? '', assetPath]);
+    } else if (m.field === 'additionalAssets') {
+      additional.push([m.label ?? '', assetPath, m.ext ?? '']);
+    } else if (m.field === 'ccAssets') {
+      cc.push({ type: m.cc_type ?? '', uri: assetPath, name: m.label ?? '', ext: m.ext ?? '' });
+    }
+  }
+
+  if (emotions.length > 0) json.emotionImages = emotions;
+  if (additional.length > 0) json.additionalAssets = additional;
+  if (cc.length > 0) json.ccAssets = cc;
 }
 
 // --- HTML injection handler ---
@@ -552,8 +798,7 @@ function main(): void {
   try {
     const db = initDb();
     dbMigrate(db);
-    resetDb(db);
-    log.info('SQLite initialized (fresh start)');
+    log.info('SQLite initialized', { blocks: blockCount(db) });
   } catch (err) {
     log.error('SQLite init failed, running in pure proxy mode', { error: String(err) });
   }
@@ -730,8 +975,7 @@ function main(): void {
           return;
         }
         const db = getDb();
-        const remotes = getAllRemoteBlocks(db);
-        const buf = serializeBatchRemotes(remotes);
+        const buf = serializeBatchRemotesFromDb(db);
 
         res.writeHead(200, {
           'content-type': 'application/octet-stream',
@@ -803,12 +1047,12 @@ function main(): void {
             if (status < 200 || status >= 300 || body.length === 0) return null;
             try {
               await captureRemoteFile(body, route.charId, remoteAuthHeader);
-              // Serve the deep-slimmed version from SQLite
+              // characters 테이블에서 slim JSON 생성하여 응답
               const db = getDb();
-              const block = getBlock(db, `remote:${route.charId}`);
-              if (block) {
+              const charRow = getCharacterByCharId(db, route.charId);
+              if (charRow) {
                 log.debug('Serving slimmed remote during hydration', { charId: route.charId });
-                return block.data;
+                return Buffer.from(buildSlimJson(charRow), 'utf-8');
               }
             } catch (e) { log.error('capture remote error during hydration', { charId: route.charId, error: String(e) }); }
             return null; // fallback to original body
