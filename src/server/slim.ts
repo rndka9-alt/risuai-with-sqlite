@@ -6,7 +6,8 @@ export const COLD_STORAGE_HEADER = '\uEF01COLDSTORAGE\uEF01';
 /**
  * Fields stripped from character JSON for landing-page optimization.
  * These are heavy text/array/object fields not needed for character listing.
- * Kept in SQLite `char_details` table and served on-demand.
+ * v2 스키마에서는 characters 테이블의 개별 컬럼으로 저장되며,
+ * /db/char-detail/{charId} 엔드포인트를 통해 on-demand 서빙.
  */
 export const HEAVY_FIELDS: string[] = [
   'firstMessage',
