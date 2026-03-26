@@ -2,16 +2,12 @@
  * Monkey-patch fetch to:
  * 1. Capture risu-auth from /api/* requests, inject into /db/* requests
  * 2. Add x-dbproxy-target-char header to POST /proxy2 requests
- * 3. Capture x-dbproxy-job-id from response headers
- * 4. Serve remote file reads from batch cache when available
+ * 3. Serve remote file reads from batch cache when available
  */
 
 import { tryServeBatchRemote, utf8ToHex } from './batch-remotes';
 import { tryServeFileList, tryServeMetaRead, onFileRemove } from './file-list-dataset';
 import { getPluginApis } from '../utils/getPluginApis';
-
-/** Track the most recent job ID from proxy2 responses */
-export let lastJobId: string | null = null;
 
 /** Cached risu-auth token captured from /api/* requests */
 let cachedAuth: string | null = null;
@@ -118,14 +114,7 @@ const patchedFetch: typeof fetch = function (input, init) {
       setHeader(init.headers, 'x-dbproxy-target-char', target);
     }
 
-    // Wrap response to capture job ID
-    return originalFetch.call(window, input, init).then((response) => {
-      const jobId = response.headers.get('x-dbproxy-job-id');
-      if (jobId) {
-        lastJobId = jobId;
-      }
-      return response;
-    });
+    return originalFetch.call(window, input, init);
   }
 
   // Intercept GET /api/list → serve from file-list dataset

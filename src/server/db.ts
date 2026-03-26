@@ -28,15 +28,6 @@ interface CharDetailRow {
   hash: string;
 }
 
-interface JobRow {
-  id: string;
-  char_id: string | null;
-  status: string;
-  response: string;
-  error: string | null;
-  created_at: number;
-  updated_at: number;
-}
 
 // ---
 
@@ -76,16 +67,6 @@ export function initDb(): Database.Database {
     CREATE INDEX IF NOT EXISTS idx_blocks_source ON blocks(source);
     CREATE INDEX IF NOT EXISTS idx_chats_char ON chats(char_id);
 
-    CREATE TABLE IF NOT EXISTS jobs (
-      id          TEXT PRIMARY KEY,
-      char_id     TEXT,
-      status      TEXT NOT NULL DEFAULT 'streaming',
-      response    TEXT NOT NULL DEFAULT '',
-      error       TEXT,
-      created_at  INTEGER DEFAULT (unixepoch()),
-      updated_at  INTEGER DEFAULT (unixepoch())
-    );
-
     CREATE TABLE IF NOT EXISTS char_details (
       char_id     TEXT PRIMARY KEY,
       data        BLOB NOT NULL,
@@ -122,7 +103,6 @@ export function resetDb(db: Database.Database): void {
     DELETE FROM blocks;
     DELETE FROM chats;
     DELETE FROM char_details;
-    DELETE FROM jobs;
     DELETE FROM file_list_cache;
   `);
 }
@@ -385,63 +365,6 @@ export function getMetaMissingLastUsed(
   return prep<{ path: string }>(db,
     "SELECT path FROM file_list_cache WHERE path LIKE 'remotes/%.meta' AND path NOT LIKE '%.meta.meta%' AND last_used IS NULL",
   ).all().map((r) => r.path);
-}
-
-// --- Job CRUD ---
-
-export function createJob(
-  db: Database.Database,
-  id: string,
-  charId: string | null,
-): void {
-  prep(db,
-    `INSERT INTO jobs (id, char_id, status, response, created_at, updated_at)
-     VALUES (?, ?, 'streaming', '', unixepoch(), unixepoch())`,
-  ).run(id, charId);
-}
-
-export function appendJobResponse(
-  db: Database.Database,
-  id: string,
-  text: string,
-): void {
-  prep(db,
-    `UPDATE jobs SET response = ?, updated_at = unixepoch() WHERE id = ?`,
-  ).run(text, id);
-}
-
-export function updateJobStatus(
-  db: Database.Database,
-  id: string,
-  status: string,
-  error?: string,
-): void {
-  prep(db,
-    `UPDATE jobs SET status = ?, error = ?, updated_at = unixepoch() WHERE id = ?`,
-  ).run(status, error ?? null, id);
-}
-
-export function getJob(
-  db: Database.Database,
-  id: string,
-): JobRow | undefined {
-  return prep<JobRow>(db,
-    'SELECT id, char_id, status, response, error, created_at, updated_at FROM jobs WHERE id = ?',
-  ).get(id);
-}
-
-export function getActiveJobs(
-  db: Database.Database,
-): JobRow[] {
-  return prep<JobRow>(db,
-    `SELECT id, char_id, status, response, error, created_at, updated_at
-     FROM jobs WHERE status IN ('streaming', 'completed', 'failed')
-     ORDER BY created_at DESC`,
-  ).all();
-}
-
-export function deleteJob(db: Database.Database, id: string): void {
-  prep(db, 'DELETE FROM jobs WHERE id = ?').run(id);
 }
 
 // --- Transaction helper ---

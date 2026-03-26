@@ -6,7 +6,6 @@
 import { installBatchRemotes } from './batch-remotes';
 import { installFileListDataset } from './file-list-dataset';
 import { install as installFetchPatch } from './fetch-patch';
-import { recoverJobs } from './recovery';
 import { installDetailLoader } from './detail-loader';
 import { checkProxyConfig } from './proxy-config-check';
 
@@ -25,12 +24,3 @@ installDetailLoader();
 // Check proxy config for usePlainFetch warning
 checkProxyConfig();
 
-// Wait for DOM ready, then recover any pending jobs
-if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', () => {
-    // Delay slightly to let RisuAI initialize __pluginApis__
-    setTimeout(recoverJobs, 2000);
-  });
-} else {
-  setTimeout(recoverJobs, 2000);
-}

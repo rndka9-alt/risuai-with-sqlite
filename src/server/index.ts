@@ -4,6 +4,7 @@ import { PORT, UPSTREAM, CLIENT_ID_HEADER, REQUEST_ID_HEADER, RISU_AUTH_HEADER, 
 import { forwardRequest, forwardAndTee, forwardBufferAndTransform, decodeFilePath, fetchFromUpstream } from './proxy';
 import { createCircuitBreaker } from './circuit-breaker';
 import { initDb, resetDb, isDbReady, getDb, getBlock, getBlocksBySource, getAllRemoteBlocks, upsertBlock, upsertChat, upsertCharDetail, getCharDetail, getAllCharDetails, getChat, inTransaction, populateFileListCache, getFileListCache, isFileListCacheReady, addToFileListCache, removeFromFileListCache, upsertMetaLastUsed, getMetaEntries, getMetaMissingLastUsed } from './db';
+
 import { parseRisuSave, parseRemoteFile, parseRemotePointer } from './parser';
 import { assembleRisuSave } from './assembler';
 import { slimRemote } from './slim';
@@ -12,7 +13,7 @@ import { writeToUpstream } from './proxy';
 import { handleWriteDatabase, handleWriteRemote } from './write-handler';
 import { handleRemoveAsset, handleRemoveFile } from './remove-handler';
 import { reconcileDatabaseBin, reconcileRemoteFile } from './reconcile';
-import { handleProxy2, handleGetActiveJobs, handleJobStream, handleJobAbort, handleJobConsume } from './stream-buffer';
+import { handleProxy2 } from './stream-buffer';
 import { getClientJs, injectScriptTag } from './client-bundle';
 import * as log from './logger';
 import { RisuSaveType, toRisuSaveType, type HydrationState } from '../shared/types';
@@ -26,9 +27,6 @@ import { dbMigrate } from './dbMigrate';
 const REMOTE_FILE_RE = /^remotes\/(.+)\.local\.bin$/;
 const COLDSTORAGE_RE = /^coldstorage\/(.+)$/;
 const DATABASE_BIN = 'database/database.bin';
-const JOB_STREAM_RE = /^\/db\/jobs\/([^/]+)\/stream$/;
-const JOB_ABORT_RE = /^\/db\/jobs\/([^/]+)\/abort$/;
-const JOB_CONSUME_RE = /^\/db\/jobs\/([^/]+)\/consume$/;
 const CHAR_DETAIL_RE = /^\/db\/char-detail\/(.+)$/;
 
 type Route =
@@ -39,10 +37,6 @@ type Route =
   | { type: 'write-remote'; charId: string }
   | { type: 'proxy2' }
   | { type: 'db-client-js' }
-  | { type: 'db-jobs-active' }
-  | { type: 'db-job-stream'; jobId: string }
-  | { type: 'db-job-abort'; jobId: string }
-  | { type: 'db-job-consume'; jobId: string }
   | { type: 'db-char-detail'; charId: string }
   | { type: 'db-char-details' }
   | { type: 'db-batch-remotes' }
@@ -60,22 +54,6 @@ function classifyRequest(req: http.IncomingMessage): Route {
   // DB Proxy endpoints
   if (url === '/db/client.js' && req.method === 'GET') {
     return { type: 'db-client-js' };
-  }
-  if (url === '/db/jobs/active' && req.method === 'GET') {
-    return { type: 'db-jobs-active' };
-  }
-
-  const streamMatch = url.match(JOB_STREAM_RE);
-  if (streamMatch && req.method === 'GET') {
-    return { type: 'db-job-stream', jobId: streamMatch[1] };
-  }
-  const abortMatch = url.match(JOB_ABORT_RE);
-  if (abortMatch && req.method === 'POST') {
-    return { type: 'db-job-abort', jobId: abortMatch[1] };
-  }
-  const consumeMatch = url.match(JOB_CONSUME_RE);
-  if (consumeMatch && req.method === 'POST') {
-    return { type: 'db-job-consume', jobId: consumeMatch[1] };
   }
 
   // File list dataset endpoint
@@ -664,46 +642,6 @@ function main(): void {
         return;
       }
 
-      case 'db-jobs-active': {
-        if (!isDbReady()) {
-          res.writeHead(200, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({ jobs: [] }));
-          return;
-        }
-        handleGetActiveJobs(req, res, getDb());
-        return;
-      }
-
-      case 'db-job-stream': {
-        if (!isDbReady()) {
-          res.writeHead(404, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({ error: 'DB not ready' }));
-          return;
-        }
-        handleJobStream(req, res, route.jobId, getDb());
-        return;
-      }
-
-      case 'db-job-abort': {
-        if (!isDbReady()) {
-          res.writeHead(404, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({ error: 'DB not ready' }));
-          return;
-        }
-        handleJobAbort(req, res, route.jobId, getDb());
-        return;
-      }
-
-      case 'db-job-consume': {
-        if (!isDbReady()) {
-          res.writeHead(200, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({ success: true }));
-          return;
-        }
-        handleJobConsume(req, res, route.jobId, getDb());
-        return;
-      }
-
       // --- Char detail endpoints ---
       case 'db-char-detail': {
         if (!isDbReady()) {
@@ -812,11 +750,7 @@ function main(): void {
 
       // --- proxy2 ---
       case 'proxy2': {
-        if (isDbReady()) {
-          handleProxy2(req, res, getDb());
-        } else {
-          forwardRequest(req, res);
-        }
+        handleProxy2(req, res);
         return;
       }
 

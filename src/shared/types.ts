@@ -39,20 +39,3 @@ export interface ChatEntry {
 /** Hydration state */
 export type HydrationState = 'COLD' | 'WARMING' | 'HOT';
 
-/** Streaming job status */
-export type JobStatus = 'streaming' | 'completed' | 'failed' | 'aborted';
-
-export interface Job {
-  id: string;
-  charId: string | null;
-  status: JobStatus;
-  response: string;
-  error: string | null;
-  createdAt: number;
-  updatedAt: number;
-}
-
-/** Client → Server: active jobs query response */
-export interface ActiveJobsResponse {
-  jobs: Job[];
-}
