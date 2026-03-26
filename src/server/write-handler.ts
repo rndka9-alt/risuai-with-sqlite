@@ -1,11 +1,20 @@
 import http from 'http';
+import crypto from 'crypto';
 import Database from 'better-sqlite3';
 import { RISU_AUTH_HEADER } from './config';
 import { bufferBody, forwardBuffered, writeToUpstream } from './proxy';
-import { parseRisuSave, parseRemoteFile, parseRemotePointer } from './parser';
-import { slimRemote, mergeCharacterDetail } from './slim';
-import { decompressColdStorage } from './cold-compat';
-import { upsertBlock, upsertChat, upsertCharDetail, getCharDetail, purgeStaleCharDetails, inTransaction } from './db';
+import { parseRisuSave, parseRemotePointer } from './parser';
+import { COLD_STORAGE_HEADER, isColdMarker } from './slim';
+import { compressColdStorage } from './cold-compat';
+import {
+  generateId, upsertBlock, upsertCharacter, getCharacterByCharId,
+  characterJsonToColumns, characterColumnsToJson,
+  upsertChatSession, insertChatMessages,
+  softDeleteChatSessionsByCharacter, softDeleteChatMessagesBySession,
+  getChatSessionsByCharacter,
+  getAssetByHash, linkCharacterAsset, softDeleteAssetMapByCharacter,
+  softDeleteStaleCharacters, inTransaction,
+} from './db';
 import { RisuSaveType } from '../shared/types';
 import { extractUsePlainFetch } from './proxy-config-state';
 import * as log from './logger';
@@ -13,11 +22,8 @@ import * as log from './logger';
 /**
  * Handle POST /api/write for database/database.bin.
  *
- * Flow:
- * 1. Buffer the body
- * 2. Forward to upstream FIRST (write-through)
- * 3. On success: parse binary, upsert blocks in SQLite
- *    (incremental save: only upsert present blocks, never delete absent ones)
+ * 1. Forward to upstream (write-through)
+ * 2. Background: parse binary → upsert blocks + soft delete stale characters
  */
 export async function handleWriteDatabase(
   req: http.IncomingMessage,
@@ -25,17 +31,13 @@ export async function handleWriteDatabase(
   db: Database.Database,
 ): Promise<void> {
   const body = await bufferBody(req);
-
-  // Forward to upstream first — response goes to client
   forwardBuffered(req, res, body);
 
-  // Background: parse and update SQLite
   setImmediate(() => {
     try {
       const result = parseRisuSave(body);
       if (!result) return;
 
-      // Extract active character IDs from REMOTE blocks
       const activeCharIds = new Set<string>();
       for (const block of result.blocks) {
         if (block.type === RisuSaveType.REMOTE) {
@@ -46,25 +48,17 @@ export async function handleWriteDatabase(
 
       inTransaction(db, () => {
         for (const block of result.blocks) {
-          upsertBlock(
-            db,
-            block.name,
-            block.type,
-            'database.bin',
-            block.compression,
-            block.data,
-            block.hash,
-          );
+          const dataStr = block.data.toString('utf-8');
+          upsertBlock(db, generateId(db), block.name, block.type, 'database.bin', dataStr, block.hash);
           if (block.type === RisuSaveType.ROOT) {
             extractUsePlainFetch(block.data);
           }
         }
 
-        // Purge char_details for deleted characters
         if (activeCharIds.size > 0) {
-          const purged = purgeStaleCharDetails(db, activeCharIds);
+          const purged = softDeleteStaleCharacters(db, activeCharIds);
           if (purged.length > 0) {
-            log.info('Purged stale char_details', { charIds: purged });
+            log.info('Soft-deleted stale characters', { charIds: purged });
           }
         }
       });
@@ -77,11 +71,9 @@ export async function handleWriteDatabase(
 /**
  * Handle POST /api/write for remotes/{charId}.local.bin.
  *
- * Flow:
- * 1. Buffer the body
- * 2. If __strippedFields present: merge stored detail back before forwarding
- * 3. Forward (full) body to upstream (write-through)
- * 4. Background: slim chats → deep slim fields → store in SQLite
+ * 1. If __strippedFields: merge stored fields from DB columns
+ * 2. Forward full body to upstream
+ * 3. Background: normalize into characters/chat_sessions/chat_messages/assets
  */
 export async function handleWriteRemote(
   req: http.IncomingMessage,
@@ -94,51 +86,197 @@ export async function handleWriteRemote(
     ? req.headers[RISU_AUTH_HEADER]
     : undefined;
 
-  // Merge stored detail if fields were stripped (client hadn't loaded detail yet)
+  // __strippedFields → DB 컬럼에서 heavy 필드 복원
   try {
     const charJson = body.toString('utf-8');
     const parsed = JSON.parse(charJson);
 
     if (Array.isArray(parsed.__strippedFields)) {
-      const storedDetail = getCharDetail(db, charId);
-      if (storedDetail) {
-        const detailJson = await decompressColdStorage(storedDetail.data);
-        const fullJson = mergeCharacterDetail(charJson, detailJson);
-        body = Buffer.from(fullJson, 'utf-8');
-        log.debug('Merged stored detail into write body', { charId, strippedFields: parsed.__strippedFields.length });
+      const existingRow = getCharacterByCharId(db, charId);
+      if (existingRow) {
+        const storedFields = characterColumnsToJson(existingRow);
+        for (const field of parsed.__strippedFields) {
+          if (field in storedFields) {
+            parsed[field] = storedFields[field];
+          }
+        }
+        delete parsed.__strippedFields;
+        body = Buffer.from(JSON.stringify(parsed), 'utf-8');
+        log.debug('Merged stored fields into write body', { charId });
       } else {
-        log.warn('__strippedFields present but no stored detail found', { charId });
+        log.warn('__strippedFields present but no stored character found', { charId });
       }
     }
   } catch (err) {
     log.warn('Detail merge failed, forwarding original body', { charId, error: String(err) });
   }
 
-  // Forward to upstream (with full data)
   forwardBuffered(req, res, body);
 
-  // Background: parse and update SQLite
   setImmediate(async () => {
     try {
-      const block = parseRemoteFile(body, charId);
-      if (!block) return;
+      const charJsonStr = body.toString('utf-8');
+      const charObj = JSON.parse(charJsonStr);
+      const hash = crypto.createHash('sha256').update(charJsonStr).digest('hex');
 
-      const charJson = block.data.toString('utf-8');
-      const slimmed = await slimRemote(charJson, charId);
+      const existing = getCharacterByCharId(db, charId);
+      const wsId = existing?.__ws_id ?? generateId(db);
+
+      const { columns, unknownFields } = characterJsonToColumns(charObj);
+      if (unknownFields.length > 0) {
+        log.warn('Unknown character fields (migration needed)', {
+          charId,
+          fields: unknownFields.join(', '),
+        });
+      }
 
       inTransaction(db, () => {
-        upsertBlock(db, `remote:${charId}`, RisuSaveType.CHARACTER_WITH_CHAT, `remote:${charId}`, 0, slimmed.deepSlimBuffer, block.hash);
-        upsertCharDetail(db, charId, slimmed.detailCompressed, slimmed.detailHash);
-        for (const entry of slimmed.coldEntries) {
-          upsertChat(db, entry.uuid, entry.charId, entry.chatIndex, entry.compressed, entry.hash);
-        }
+        upsertCharacter(db, wsId, charId, hash, `remotes/${charId}.local.bin`, columns);
+        softDeleteAssetMapByCharacter(db, wsId);
+        extractAndLinkAssets(db, wsId, charObj);
+        storeChats(db, wsId, charObj.chats, authHeader);
       });
-
-      for (const entry of slimmed.coldEntries) {
-        writeToUpstream(`coldstorage/${entry.uuid}`, entry.compressed, authHeader);
-      }
     } catch (err) {
       log.error('write-remote background parse error', { error: String(err) });
     }
   });
+}
+
+/** 캐릭터 JSON에서 에셋 참조 추출 → character_asset_map */
+function extractAndLinkAssets(
+  db: Database.Database,
+  characterWsId: string,
+  charObj: Record<string, unknown>,
+): void {
+  // image (단일)
+  if (typeof charObj.image === 'string' && charObj.image) {
+    const assetWsId = ensureAsset(db, charObj.image);
+    if (assetWsId) linkCharacterAsset(db, characterWsId, assetWsId, 'image', null, null, null, 0);
+  }
+
+  // emotionImages: [emotionName, assetPath][]
+  if (Array.isArray(charObj.emotionImages)) {
+    for (let i = 0; i < charObj.emotionImages.length; i++) {
+      const entry = charObj.emotionImages[i];
+      if (!Array.isArray(entry) || entry.length < 2) continue;
+      const assetWsId = ensureAsset(db, entry[1]);
+      if (assetWsId) linkCharacterAsset(db, characterWsId, assetWsId, 'emotionImages', entry[0], null, null, i);
+    }
+  }
+
+  // additionalAssets: [name, assetPath, extension][]
+  if (Array.isArray(charObj.additionalAssets)) {
+    for (let i = 0; i < charObj.additionalAssets.length; i++) {
+      const entry = charObj.additionalAssets[i];
+      if (!Array.isArray(entry) || entry.length < 2) continue;
+      const assetWsId = ensureAsset(db, entry[1]);
+      if (assetWsId) linkCharacterAsset(db, characterWsId, assetWsId, 'additionalAssets', entry[0], entry[2] ?? null, null, i);
+    }
+  }
+
+  // ccAssets: {type, uri, name, ext}[]
+  if (Array.isArray(charObj.ccAssets)) {
+    for (let i = 0; i < charObj.ccAssets.length; i++) {
+      const entry = charObj.ccAssets[i] as Record<string, string> | undefined;
+      if (!entry?.uri) continue;
+      const assetWsId = ensureAsset(db, entry.uri);
+      if (assetWsId) linkCharacterAsset(db, characterWsId, assetWsId, 'ccAssets', entry.name ?? null, entry.ext ?? null, entry.type ?? null, i);
+    }
+  }
+}
+
+/** 에셋 경로에서 hash 추출, assets 테이블에 메타 등록 (바이너리는 별도) */
+function ensureAsset(db: Database.Database, assetPath: string): string | null {
+  const match = assetPath.match(/^assets\/([^.]+)/);
+  if (!match) return null;
+  const hash = match[1];
+
+  const existing = getAssetByHash(db, hash);
+  if (existing) return existing.__ws_id;
+
+  const wsId = generateId(db);
+  const ext = assetPath.split('.').pop() ?? '';
+  const mimeType = ext === 'png' ? 'image/png'
+    : ext === 'webp' ? 'image/webp'
+    : ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg'
+    : ext === 'gif' ? 'image/gif'
+    : ext === 'mp3' ? 'audio/mpeg'
+    : ext === 'wav' ? 'audio/wav'
+    : null;
+
+  db.prepare('INSERT INTO assets (__ws_id, hash, mime_type, __ws_source_file) VALUES (?, ?, ?, ?)').run(wsId, hash, mimeType, assetPath);
+  return wsId;
+}
+
+/** 채팅 배열 → chat_sessions + chat_messages 정규화 */
+function storeChats(
+  db: Database.Database,
+  characterWsId: string,
+  chats: unknown,
+  authHeader: string | undefined,
+): void {
+  if (!Array.isArray(chats)) return;
+
+  // 기존 세션+메시지 soft delete
+  const existingSessions = getChatSessionsByCharacter(db, characterWsId);
+  for (const session of existingSessions) {
+    softDeleteChatMessagesBySession(db, session.__ws_id);
+  }
+  softDeleteChatSessionsByCharacter(db, characterWsId);
+
+  for (let i = 0; i < chats.length; i++) {
+    const chat = chats[i];
+    if (!chat || typeof chat !== 'object') continue;
+
+    const sessionWsId = generateId(db);
+    const sessionFields = {
+      hypa_v2: JSON.stringify(chat.hypaV2Data ?? {}),
+      hypa_v3: JSON.stringify(chat.hypaV3Data ?? {}),
+      script_state: JSON.stringify(chat.scriptstate ?? {}),
+      local_lore: JSON.stringify(chat.localLore ?? []),
+      folder_id: chat.folderId ?? null,
+      last_date: chat.lastDate ?? null,
+      fm_index: chat.fmIndex ?? null,
+      bookmarks: JSON.stringify(chat.bookmarks ?? []),
+      bookmark_names: JSON.stringify(chat.bookmarkNames ?? {}),
+    };
+
+    // cold storage 마커 → 메시지 없이 세션만 저장
+    if (isColdMarker(chat)) {
+      const markerData = chat.message?.[0]?.data ?? '';
+      const uuid = markerData.startsWith(COLD_STORAGE_HEADER)
+        ? markerData.slice(COLD_STORAGE_HEADER.length)
+        : null;
+
+      upsertChatSession(db, sessionWsId, characterWsId, uuid, i, sessionFields, null, uuid ? `coldstorage/${uuid}` : null);
+      continue;
+    }
+
+    // 일반 채팅: cold storage 파일 생성 + 메시지 정규화
+    const messages: Array<Record<string, unknown>> = Array.isArray(chat.message) ? chat.message : [];
+    const hash = messages.length > 0
+      ? crypto.createHash('sha256').update(JSON.stringify(messages)).digest('hex')
+      : null;
+
+    let uuid: string | null = null;
+    if (messages.length > 0) {
+      uuid = crypto.randomUUID();
+      const coldPayload = JSON.stringify({
+        message: chat.message,
+        hypaV2Data: chat.hypaV2Data,
+        hypaV3Data: chat.hypaV3Data,
+        scriptstate: chat.scriptstate,
+        localLore: chat.localLore,
+      });
+      compressColdStorage(coldPayload).then((compressed) => {
+        writeToUpstream(`coldstorage/${uuid}`, compressed, authHeader);
+      }).catch(() => {});
+    }
+
+    upsertChatSession(db, sessionWsId, characterWsId, uuid, i, sessionFields, hash, uuid ? `coldstorage/${uuid}` : null);
+
+    if (messages.length > 0) {
+      insertChatMessages(db, sessionWsId, messages);
+    }
+  }
 }

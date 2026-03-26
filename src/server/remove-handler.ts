@@ -1,57 +1,19 @@
 import http from 'http';
 import Database from 'better-sqlite3';
-import { getCharDetailBlobs } from './db';
-import { decompressColdStorage } from './cold-compat';
-import { removeFromFileListCache } from './db';
+import { isAssetHashReferenced, removeFromFileListCache } from './db';
 import { forwardAndTee } from './proxy';
 import { requestFileListReconciliation } from './periodic-sync';
 import * as log from './logger';
 
 /**
- * Asset path patterns that getUncleanables() in RisuAI checks
- * against deep-slim stripped fields: emotionImages, additionalAssets, ccAssets.
- *
- * If an asset is referenced in any of these fields (stored in char_details),
- * we must block the remove — the client can't see the reference because
- * deep-slim replaced the field with an empty array.
- */
-
-/**
- * Check if an asset filename appears in any char_details blob.
- * Returns true if the asset is referenced (should be protected).
- */
-async function isAssetReferenced(
-  db: Database.Database,
-  assetPath: string,
-): Promise<boolean> {
-  const rows = getCharDetailBlobs(db);
-  if (rows.length === 0) return false;
-
-  // Extract the basename for matching — char data may store
-  // just the filename or a relative path like "assets/abc.png"
-  const basename = assetPath.split('/').pop() ?? assetPath;
-
-  for (const row of rows) {
-    try {
-      const json = await decompressColdStorage(row.data);
-      if (json.includes(basename)) {
-        return true;
-      }
-    } catch {
-      // Decompression failure — skip this entry
-    }
-  }
-
-  return false;
-}
-
-/**
  * Handle GET /api/remove for assets/*.
  *
- * 1. Check char_details for references to the asset
- * 2. If referenced → return success without forwarding (protect from deep-slim false positive)
- * 3. If not referenced → forward to upstream (legitimate cleanup)
- * 4. On any error → fallback to upstream (P1: transparency)
+ * v2: character_asset_map 인덱스 조회로 참조 확인 (gunzip 루프 제거).
+ *
+ * 1. character_asset_map에서 에셋 참조 여부 확인
+ * 2. 참조 중 → success 반환 (삭제 차단)
+ * 3. 참조 없음 → upstream으로 forward
+ * 4. 에러 → upstream으로 fallback (P1 투명성)
  */
 export async function handleRemoveAsset(
   req: http.IncomingMessage,
@@ -60,10 +22,14 @@ export async function handleRemoveAsset(
   db: Database.Database,
 ): Promise<void> {
   try {
-    const referenced = await isAssetReferenced(db, filePath);
+    // 에셋 경로에서 hash 추출: 'assets/abc123.png' → 'abc123'
+    const basename = filePath.split('/').pop() ?? filePath;
+    const hash = basename.split('.')[0];
+
+    const referenced = isAssetHashReferenced(db, hash);
 
     if (referenced) {
-      log.info('Blocked asset remove (referenced in char_details)', { filePath });
+      log.info('Blocked asset remove (referenced in character_asset_map)', { filePath });
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ success: true }));
       return;
@@ -77,7 +43,6 @@ export async function handleRemoveAsset(
     });
   }
 
-  // Not referenced or error → forward to upstream
   forwardAndTee(req, res, (status) => {
     if (status >= 400) {
       requestFileListReconciliation(db);
@@ -86,15 +51,8 @@ export async function handleRemoveAsset(
 }
 
 /**
- * Handle GET /api/remove for non-asset files (e.g. database/dbbackup-*.bin).
- *
- * Uses forwardAndTee to forward the request and always cleans the
- * file_list_cache entry regardless of upstream status.
- *
- * Remove is idempotent: whether upstream returns 2xx (file deleted) or
- * 500 (file already gone / ENOENT), the file should not appear in
- * /api/list afterwards. The res.on('finish') handler in index.ts
- * also cleans the cache as a secondary guarantee.
+ * Handle GET /api/remove for non-asset files.
+ * Forward + clean file_list_cache.
  */
 export function handleRemoveFile(
   req: http.IncomingMessage,
