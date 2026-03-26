@@ -7,6 +7,7 @@ import { slimRemote, mergeCharacterDetail } from './slim';
 import { decompressColdStorage } from './cold-compat';
 import { upsertBlock, upsertChat, upsertCharDetail, getCharDetail, purgeStaleCharDetails, inTransaction } from './db';
 import { RisuSaveType } from '../shared/types';
+import { extractUsePlainFetch } from './proxy-config-state';
 import * as log from './logger';
 
 /**
@@ -54,6 +55,9 @@ export async function handleWriteDatabase(
             block.data,
             block.hash,
           );
+          if (block.type === RisuSaveType.ROOT) {
+            extractUsePlainFetch(block.data);
+          }
         }
 
         // Purge char_details for deleted characters
