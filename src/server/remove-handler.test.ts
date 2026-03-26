@@ -19,16 +19,12 @@ vi.mock('./logger', () => ({
 import { forwardAndTee } from './proxy';
 import * as log from './logger';
 
+import { DDL } from './schema';
+
 function createTestDb(): Database.Database {
   const db = new Database(':memory:');
   db.pragma('journal_mode = WAL');
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS file_list_cache (
-      path        TEXT PRIMARY KEY,
-      last_used   INTEGER,
-      updated_at  INTEGER DEFAULT (unixepoch())
-    );
-  `);
+  db.exec(DDL);
   return db;
 }
 
