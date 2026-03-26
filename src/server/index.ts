@@ -317,6 +317,64 @@ async function hydrateMissingMetaLastUsed(
   }));
 }
 
+/**
+ * 바이너리 없는 에셋을 upstream에서 fetch하여 DB에 저장.
+ * 동시 요청 제한(10)으로 upstream 부하 방지.
+ */
+async function hydrateAssetBinaries(authHeader: string | undefined): Promise<void> {
+  if (!isDbReady()) return;
+  const db = getDb();
+
+  const missing = db.prepare(
+    'SELECT __ws_id, hash, __ws_source_file FROM assets WHERE data IS NULL AND __ws_deleted_at IS NULL',
+  ).all() as Array<{ __ws_id: string; hash: string; __ws_source_file: string | null }>;
+
+  if (missing.length === 0) {
+    log.info('Asset hydration skipped (no missing binaries)');
+    return;
+  }
+
+  log.info('Asset hydration started', { total: String(missing.length) });
+  const t0 = performance.now();
+  let fetched = 0;
+  let failed = 0;
+
+  // 동시 10개씩 batch fetch
+  const CONCURRENCY = 10;
+  for (let i = 0; i < missing.length; i += CONCURRENCY) {
+    const batch = missing.slice(i, i + CONCURRENCY);
+    await Promise.all(batch.map(async (asset) => {
+      const filePath = asset.__ws_source_file || `assets/${asset.hash}.png`;
+      try {
+        const body = await fetchFromUpstream(filePath, authHeader);
+        if (body && body.length > 0) {
+          const ext = filePath.split('.').pop() ?? '';
+          const mimeType = ext === 'png' ? 'image/png'
+            : ext === 'webp' ? 'image/webp'
+            : ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg'
+            : ext === 'gif' ? 'image/gif'
+            : ext === 'mp3' ? 'audio/mpeg'
+            : null;
+          upsertAsset(db, asset.__ws_id, asset.hash, body, mimeType, filePath);
+          fetched++;
+        } else {
+          failed++;
+        }
+      } catch {
+        failed++;
+      }
+    }));
+  }
+
+  const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+  log.info('Asset hydration finished', {
+    fetched: String(fetched),
+    failed: String(failed),
+    total: String(missing.length),
+    seconds: elapsed,
+  });
+}
+
 /** Proactively fetch all remotes from upstream after database.bin is captured. */
 async function proactiveHydration(charIds: string[], authHeader: string | undefined): Promise<void> {
   log.info('Proactive hydration started', { remotes: String(charIds.length) });
@@ -335,6 +393,12 @@ async function proactiveHydration(charIds: string[], authHeader: string | undefi
   );
 
   log.info('Proactive hydration finished', { ms: (performance.now() - t0).toFixed(0), captured: capturedRemotes.size + '/' + expectedRemoteCount });
+
+  // 캐릭터 hydration 후 바로 에셋 바이너리 fetch
+  log.info('Triggering asset hydration after proactive hydration');
+  hydrateAssetBinaries(authHeader).catch((e) =>
+    log.warn('Asset hydration error', { error: String(e) }),
+  );
 }
 
 function captureDatabaseBin(body: Buffer, authHeader: string | undefined): void {
@@ -349,6 +413,10 @@ function captureDatabaseBin(body: Buffer, authHeader: string | undefined): void 
 
   storedAuthHeader = authHeader;
   const charIds: string[] = [];
+
+  // 재호출 시 누적 방지
+  expectedRemoteCount = 0;
+  capturedRemotes.clear();
 
   inTransaction(db, () => {
     for (const block of result.blocks) {
@@ -1257,11 +1325,48 @@ function main(): void {
       // 2. Hydrate .meta lastUsed
       await hydrateMissingMetaLastUsed(getDb(), token);
 
-      // 3. Hydrate database.bin → blocks + remotes
+      // 3. Hydrate database.bin → blocks + remotes (self-auth 전용 동기 흐름)
       const dbBody = await fetchFromUpstream('database/database.bin', token);
       if (dbBody && dbBody.length > 0) {
-        captureDatabaseBin(dbBody, token);
+        // captureDatabaseBin의 block 저장 부분만 실행 (proactive는 직접 await)
+        const result = parseRisuSave(dbBody);
+        if (result) {
+          const charIds: string[] = [];
+          expectedRemoteCount = 0;
+          capturedRemotes.clear();
+
+          inTransaction(getDb(), () => {
+            for (const block of result.blocks) {
+              const dataStr = block.data.toString('utf-8');
+              upsertBlock(getDb(), generateId(getDb()), block.name, block.type, 'database.bin', dataStr, block.hash);
+              if (block.type === RisuSaveType.REMOTE) {
+                const ptr = parseRemotePointer(block.data);
+                if (ptr) {
+                  expectedRemoteCount++;
+                  charIds.push(ptr.charId);
+                }
+              }
+              if (block.type === RisuSaveType.ROOT) {
+                extractUsePlainFetch(block.data);
+              }
+            }
+          });
+
+          hydrationState = 'WARMING';
+          log.info('database.bin captured (self-auth)', { blocks: result.blocks.length, remotes: expectedRemoteCount });
+
+          // proactiveHydration을 await로 직접 대기
+          await proactiveHydration(charIds, token);
+          hydrationState = resolveHydration();
+
+          log.info('Self-auth hydration done', {
+            state: hydrationState,
+            captured: capturedRemotes.size + '/' + expectedRemoteCount,
+          });
+        }
       }
+
+      // 4. Asset hydration은 proactiveHydration 끝에서 자동 실행
 
       // Start periodic sync (24h interval)
       startPeriodicSync(getDb);
