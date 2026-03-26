@@ -11,7 +11,7 @@ import {
   getChatSessionByUuid, getChatSessionsByCharacter,
   getChatMessagesBySession, upsertChatSession, insertChatMessages,
   softDeleteChatSessionsByCharacter, softDeleteChatMessagesBySession,
-  getAssetByHash, linkCharacterAsset, softDeleteAssetMapByCharacter,
+  upsertAsset, getAssetByHash, linkCharacterAsset, softDeleteAssetMapByCharacter,
   getAssetMapByCharacter,
   softDeleteStaleCharacters, inTransaction,
   populateFileListCache, getFileListCache, isFileListCacheReady,
@@ -59,6 +59,7 @@ type Route =
   | { type: 'proxy-config' }
   | { type: 'root-html' }
   | { type: 'list-files' }
+  | { type: 'write-asset'; filePath: string }
   | { type: 'remove-asset'; filePath: string }
   | { type: 'remove-file'; filePath: string }
   | { type: 'passthrough' };
@@ -142,6 +143,11 @@ function classifyRequest(req: http.IncomingMessage): Route {
       const coldMatch = filePath.match(COLDSTORAGE_RE);
       if (coldMatch && isRead) {
         return { type: 'read-coldstorage', key: coldMatch[1] };
+      }
+
+      // 에셋 write: assets/ 경로의 POST
+      if (filePath.startsWith('assets/') && isWrite) {
+        return { type: 'write-asset', filePath };
       }
     }
   }
@@ -1097,6 +1103,43 @@ function main(): void {
         if (isDbReady()) {
           try { handleWriteRemote(req, res, route.charId, getDb()); return; }
           catch (err) { log.warn('write-remote error, bypassing', { charId: route.charId, error: err instanceof Error ? err.message : String(err) }); }
+        }
+        forwardRequest(req, res);
+        return;
+      }
+
+      // 에셋 write → upstream 전달 + BLOB 저장 (소프트 딜리트 복구용)
+      case 'write-asset': {
+        if (isDbReady()) {
+          const db = getDb();
+          forwardBufferAndTransform(req, res, (status, _headers, body) => {
+            if (status >= 200 && status < 300 && body.length > 0) {
+              setImmediate(() => {
+                try {
+                  const match = route.filePath.match(/^assets\/([^.]+)/);
+                  if (!match) return;
+                  const hash = match[1];
+                  const ext = route.filePath.split('.').pop() ?? '';
+                  const mimeType = ext === 'png' ? 'image/png'
+                    : ext === 'webp' ? 'image/webp'
+                    : ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg'
+                    : ext === 'gif' ? 'image/gif'
+                    : ext === 'mp3' ? 'audio/mpeg'
+                    : ext === 'wav' ? 'audio/wav'
+                    : null;
+
+                  const existing = getAssetByHash(db, hash);
+                  const wsId = existing?.__ws_id ?? generateId(db);
+                  upsertAsset(db, wsId, hash, body, mimeType, route.filePath);
+                  log.debug('Asset binary stored', { filePath: route.filePath, sizeKB: (body.length / 1024).toFixed(0) });
+                } catch (err) {
+                  log.warn('Asset store failed', { filePath: route.filePath, error: String(err) });
+                }
+              });
+            }
+            return null;
+          });
+          return;
         }
         forwardRequest(req, res);
         return;
