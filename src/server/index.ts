@@ -11,7 +11,7 @@ import {
   getChatSessionByUuid, getChatSessionsByCharacter,
   getChatMessagesBySession, upsertChatSession, insertChatMessages,
   softDeleteChatSessionsByCharacter, softDeleteChatMessagesBySession,
-  upsertAsset, getAssetByHash, linkCharacterAsset, softDeleteAssetMapByCharacter,
+  upsertAsset, getAssetByHash, getAssetById, linkCharacterAsset, softDeleteAssetMapByCharacter,
   getAssetMapByCharacter,
   softDeleteStaleCharacters, inTransaction,
   populateFileListCache, getFileListCache, isFileListCacheReady,
@@ -216,22 +216,14 @@ function buildSlimJson(row: Record<string, unknown>): string {
     json.__strippedFields = strippedFields;
   }
 
-  // 에셋 참조 복원 (slim에는 image만 포함, emotion/additional/cc는 heavy)
-  // image는 character_asset_map에서 복원
+  // image는 character_asset_map에서 복원 (slim에도 image 필요)
   const db = getDb();
   const wsId = row.__ws_id;
   if (typeof wsId === 'string') {
     const assetMap = getAssetMapByCharacter(db, wsId);
-    for (const m of assetMap) {
-      if (m.field === 'image' && m.__ws_asset_id) {
-        const asset = getAssetByHash(db, ''); // need by id
-        // image 경로는 source_file에서 복원
-      }
-    }
-    // image 복원: asset_map에서 field='image' 찾아서 경로 설정
     const imageMap = assetMap.find((m) => m.field === 'image');
     if (imageMap && imageMap.__ws_asset_id) {
-      const asset = db.prepare('SELECT hash, __ws_source_file FROM assets WHERE __ws_id = ?').get(imageMap.__ws_asset_id) as { hash: string; __ws_source_file: string } | undefined;
+      const asset = getAssetById(db, imageMap.__ws_asset_id);
       if (asset) {
         json.image = asset.__ws_source_file || `assets/${asset.hash}.png`;
       }

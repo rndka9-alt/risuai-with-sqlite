@@ -641,6 +641,12 @@ export function upsertBlock(
   data: string,
   hash: string,
 ): void {
+  // name이 같은 기존 블록이 있으면 해당 __ws_id로 upsert (중복 방지)
+  const existing = prep<{ __ws_id: string }>(db,
+    'SELECT __ws_id FROM blocks WHERE name = ? AND __ws_deleted_at IS NULL',
+  ).get(name);
+  const effectiveId = existing?.__ws_id ?? wsId;
+
   db.prepare(`
     INSERT INTO blocks (__ws_id, name, type, source, data, __ws_hash, __ws_updated_at)
     VALUES (?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
@@ -648,7 +654,7 @@ export function upsertBlock(
       name=excluded.name, type=excluded.type, source=excluded.source,
       data=excluded.data, __ws_hash=excluded.__ws_hash,
       __ws_updated_at=excluded.__ws_updated_at
-  `).run(wsId, name, type, source, data, hash);
+  `).run(effectiveId, name, type, source, data, hash);
 }
 
 /** name으로 블록 조회 (기존 코드 호환) */
