@@ -1,0 +1,1 @@
+export { parseColumnComments } from './parseColumnComments';
