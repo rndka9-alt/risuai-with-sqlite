@@ -62,6 +62,9 @@ type Route =
   | { type: 'write-asset'; filePath: string }
   | { type: 'remove-asset'; filePath: string }
   | { type: 'remove-file'; filePath: string }
+  | { type: 'internal-sql-tables' }
+  | { type: 'internal-sql-schema'; table: string }
+  | { type: 'internal-sql-query' }
   | { type: 'passthrough' };
 
 function classifyRequest(req: http.IncomingMessage): Route {
@@ -99,6 +102,18 @@ function classifyRequest(req: http.IncomingMessage): Route {
   // proxy2
   if ((url === '/proxy2' || url.startsWith('/proxy2?')) && req.method === 'POST') {
     return { type: 'proxy2' };
+  }
+
+  // Internal SQL endpoints (monitor 전용)
+  if (url === '/_internal/sql/tables' && req.method === 'GET') {
+    return { type: 'internal-sql-tables' };
+  }
+  const sqlSchemaMatch = url.match(/^\/_internal\/sql\/schema\/([^/?]+)/);
+  if (sqlSchemaMatch && req.method === 'GET') {
+    return { type: 'internal-sql-schema', table: decodeURIComponent(sqlSchemaMatch[1]) };
+  }
+  if (url === '/_internal/sql/query' && req.method === 'POST') {
+    return { type: 'internal-sql-query' };
   }
 
   // Root HTML (for script injection)
@@ -1276,6 +1291,131 @@ function main(): void {
           return;
         }
         forwardRequest(req, res);
+        return;
+      }
+
+      // --- Internal SQL endpoints (monitor용) ---
+      case 'internal-sql-tables': {
+        if (!isDbReady()) {
+          res.writeHead(503, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'DB not ready' }));
+          return;
+        }
+        const db = getDb();
+        const tables = db.prepare(
+          "SELECT name, type FROM sqlite_master WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' ORDER BY name",
+        ).all() as Array<{ name: string; type: string }>;
+        const payload = JSON.stringify({ tables });
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(payload);
+        return;
+      }
+
+      case 'internal-sql-schema': {
+        if (!isDbReady()) {
+          res.writeHead(503, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'DB not ready' }));
+          return;
+        }
+        const db = getDb();
+        const tableName = route.table;
+        // 테이블 존재 확인
+        const exists = db.prepare(
+          "SELECT 1 FROM sqlite_master WHERE name = ? AND type IN ('table', 'view')",
+        ).get(tableName);
+        if (!exists) {
+          res.writeHead(404, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: `Table not found: ${tableName}` }));
+          return;
+        }
+        const columns = db.prepare(`PRAGMA table_info("${tableName.replace(/"/g, '""')}")`).all() as Array<{
+          cid: number; name: string; type: string; notnull: number; dflt_value: string | null; pk: number;
+        }>;
+        const indexRows = db.prepare(`PRAGMA index_list("${tableName.replace(/"/g, '""')}")`).all() as Array<{
+          seq: number; name: string; unique: number;
+        }>;
+        const rowCountRow = db.prepare(
+          `SELECT COUNT(*) as count FROM "${tableName.replace(/"/g, '""')}"`,
+        ).get() as { count: number };
+        const payload = JSON.stringify({
+          table: tableName,
+          columns,
+          indexes: indexRows,
+          rowCount: rowCountRow.count,
+        });
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(payload);
+        return;
+      }
+
+      case 'internal-sql-query': {
+        if (!isDbReady()) {
+          res.writeHead(503, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'DB not ready' }));
+          return;
+        }
+        let body = '';
+        req.on('data', (chunk: Buffer) => { body += chunk.toString(); });
+        req.on('end', () => {
+          try {
+            const parsed: unknown = JSON.parse(body);
+            if (typeof parsed !== 'object' || parsed === null || !('sql' in parsed)) {
+              res.writeHead(400, { 'content-type': 'application/json' });
+              res.end(JSON.stringify({ error: 'Missing "sql" field' }));
+              return;
+            }
+            const { sql } = parsed as { sql: string };
+            if (typeof sql !== 'string' || sql.trim().length === 0) {
+              res.writeHead(400, { 'content-type': 'application/json' });
+              res.end(JSON.stringify({ error: 'Empty SQL' }));
+              return;
+            }
+
+            const trimmed = sql.trim().toUpperCase();
+            const isRead = trimmed.startsWith('SELECT')
+              || trimmed.startsWith('PRAGMA')
+              || trimmed.startsWith('EXPLAIN')
+              || trimmed.startsWith('WITH');
+
+            const db = getDb();
+            const startMs = performance.now();
+
+            if (isRead) {
+              const stmt = db.prepare(sql);
+              const rows = stmt.all() as Record<string, unknown>[];
+              const columns = rows.length > 0 ? Object.keys(rows[0]) : [];
+              const elapsed = Math.round(performance.now() - startMs);
+              const payload = JSON.stringify({
+                type: 'read',
+                columns,
+                rows: rows.slice(0, 1000),
+                totalRows: rows.length,
+                truncated: rows.length > 1000,
+                elapsedMs: elapsed,
+              });
+              res.writeHead(200, { 'content-type': 'application/json' });
+              res.end(payload);
+            } else {
+              const result = db.prepare(sql).run();
+              const elapsed = Math.round(performance.now() - startMs);
+              const payload = JSON.stringify({
+                type: 'write',
+                changes: result.changes,
+                lastInsertRowid: typeof result.lastInsertRowid === 'bigint'
+                  ? Number(result.lastInsertRowid)
+                  : result.lastInsertRowid,
+                elapsedMs: elapsed,
+              });
+              res.writeHead(200, { 'content-type': 'application/json' });
+              res.end(payload);
+            }
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            log.warn('SQL query error', { error: message });
+            res.writeHead(400, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ error: message }));
+          }
+        });
         return;
       }
 
