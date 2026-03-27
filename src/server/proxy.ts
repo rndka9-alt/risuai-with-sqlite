@@ -319,7 +319,7 @@ export function bufferBody(req: http.IncomingMessage): Promise<Buffer> {
 // Filesystem direct-read (via /risuai-save mount)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-function saveMountPath(filePath: string): string {
+export function saveMountPath(filePath: string): string {
   return path.join(RISUAI_SAVE_MOUNT, encodeFilePath(filePath));
 }
 
@@ -340,6 +340,11 @@ export async function readFromSaveMount(filePath: string): Promise<Buffer | null
   } catch {
     return null;
   }
+}
+
+/** Open a ReadStream from the save mount. Caller must handle errors. */
+export function createSaveMountReadStream(filePath: string): ReturnType<typeof createReadStream> {
+  return createReadStream(saveMountPath(filePath));
 }
 
 /** Stream-compute SHA-256 hash of a file on the save mount without buffering. */

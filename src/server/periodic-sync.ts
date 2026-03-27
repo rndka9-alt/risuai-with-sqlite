@@ -6,10 +6,11 @@
  */
 
 import type Database from 'better-sqlite3';
-import { fetchFromUpstream, readFromSaveMount } from './proxy';
+import { fetchFromUpstream, readFromSaveMount, saveMountPath } from './proxy';
 import { populateFileListCache, getFileListCache, upsertMetaLastUsed, getMetaEntries, getMetaMissingLastUsed } from './db';
-import { reconcileDatabaseBin, reconcileRemoteFile } from './reconcile';
+import { reconcileDatabaseBin, reconcileRemoteFile, reconcileDatabaseBinStreaming } from './reconcile';
 import { parseRisuSave, parseRemotePointer } from './parser';
+import { streamRisuSave } from '../utils/streamRisuSave';
 import { issueInternalToken, isAuthReady } from './auth';
 import { RisuSaveType } from '../shared/types';
 import * as log from './logger';
@@ -63,11 +64,11 @@ export async function runSync(getDb: () => Database.Database): Promise<SyncResul
   // 2. .meta lastUsed sync
   const metaDrift = await syncMeta(db, token);
 
-  // 3. database.bin reconciliation (결과를 syncRemotes에서 재사용)
-  const { drifted: dbDrift, body: dbBinBody } = await syncDatabaseBin(db, token);
+  // 3. database.bin reconciliation (블록 단위 스트리밍)
+  const dbDrift = await syncDatabaseBin(db);
 
-  // 4. Remote character reconciliation
-  const remoteDrift = await syncRemotes(db, token, dbBinBody);
+  // 4. Remote character reconciliation (charIds를 FS에서 직접 추출)
+  const remoteDrift = await syncRemotes(db, token);
 
   const elapsed = Math.round(performance.now() - t0);
   const hasDrift = fileListDrift.added > 0 || fileListDrift.removed > 0
@@ -172,33 +173,32 @@ async function syncMeta(
 
 async function syncDatabaseBin(
   db: Database.Database,
-  token: string,
-): Promise<{ drifted: boolean; body: Buffer | null }> {
-  const body = await readFromSaveMount('database/database.bin')
-    ?? await fetchFromUpstream('database/database.bin', token);
-  if (!body || body.length === 0) return { drifted: false, body: null };
-  const drifted = reconcileDatabaseBin(db, Buffer.from(body));
-  return { drifted, body };
+): Promise<boolean> {
+  const fsPath = saveMountPath('database/database.bin');
+  try {
+    return await reconcileDatabaseBinStreaming(db, fsPath);
+  } catch {
+    return false;
+  }
 }
 
 async function syncRemotes(
   db: Database.Database,
   token: string,
-  dbBinBody: Buffer | null,
 ): Promise<number> {
-  // syncDatabaseBin에서 이미 fetch한 결과를 재사용
-  const buf = dbBinBody ?? await fetchFromUpstream('database/database.bin', token);
-  if (!buf || buf.length === 0) return 0;
-
-  const result = parseRisuSave(Buffer.from(buf));
-  if (!result) return 0;
-
+  // database.bin에서 REMOTE 포인터만 스트리밍으로 추출
+  const fsPath = saveMountPath('database/database.bin');
   const charIds: string[] = [];
-  for (const block of result.blocks) {
-    if (block.type === RisuSaveType.REMOTE) {
-      const ptr = parseRemotePointer(block.data);
-      if (ptr) charIds.push(ptr.charId);
-    }
+  try {
+    await streamRisuSave(fsPath, {
+      onHeader: (h) => h.type === RisuSaveType.REMOTE ? 'read' : 'skip',
+      onBlock: (block) => {
+        const ptr = parseRemotePointer(block.data);
+        if (ptr) charIds.push(ptr.charId);
+      },
+    });
+  } catch {
+    return 0;
   }
 
   let updated = 0;

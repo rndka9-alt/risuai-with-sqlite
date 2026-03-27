@@ -4,7 +4,9 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "better-sqlite3": "^11.8.2"
+    "better-sqlite3": "^11.8.2",
+    "stream-chain": "^3.6.0",
+    "stream-json": "^2.0.0"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",

@@ -17,7 +17,7 @@ esbuild.buildSync({
   format: 'esm',
   outfile: 'dist/server.js',
   target: 'node18',
-  external: ['better-sqlite3'],
+  external: ['better-sqlite3', 'stream-json', 'stream-chain'],
   sourcemap: true,
 });
 

@@ -13,6 +13,7 @@ import { compressColdStorage } from './cold-compat';
 import { writeToUpstream } from './proxy';
 import { RisuSaveType } from '../shared/types';
 import { extractUsePlainFetch } from './proxy-config-state';
+import { streamRisuSave } from '../utils/streamRisuSave';
 import * as log from './logger';
 
 // write-handler의 storeChats, extractAndLinkAssets를 재사용하기 위해
@@ -232,4 +233,87 @@ function reconcileChats(
       insertChatMessages(db, sessionWsId, messages);
     }
   }
+}
+
+/**
+ * database.bin을 블록 단위로 스트리밍 파싱하여 reconcile.
+ * CHARACTER_WITH_CHAT 블록은 건너뛰고 메타데이터 블록만 읽는다.
+ * 4GB 파일이라도 피크 메모리는 가장 큰 메타데이터 블록 크기 수준.
+ */
+export async function reconcileDatabaseBinStreaming(
+  db: Database.Database,
+  fsPath: string,
+): Promise<boolean> {
+  let driftCount = 0;
+
+  const SKIP_TYPES = new Set([
+    RisuSaveType.CHARACTER_WITH_CHAT,
+    RisuSaveType.CHARACTER_WITHOUT_CHAT,
+    RisuSaveType.CHAT,
+  ]);
+
+  const { blocksTotal, blocksRead, blocksSkipped } = await streamRisuSave(fsPath, {
+    onHeader: (header) => SKIP_TYPES.has(header.type) ? 'skip' : 'read',
+    onBlock: (block) => {
+      const existingHash = getBlockHash(db, block.header.name);
+      if (existingHash !== block.hash) {
+        const dataStr = block.data.toString('utf-8');
+        inTransaction(db, () => {
+          upsertBlock(db, generateId(db), block.header.name, block.header.type, 'database.bin', dataStr, block.hash);
+        });
+        driftCount++;
+      }
+      if (block.header.type === RisuSaveType.ROOT) {
+        extractUsePlainFetch(block.data);
+      }
+    },
+  });
+
+  if (driftCount > 0) {
+    log.info('Reconcile database.bin (streaming)', {
+      blocksUpdated: driftCount,
+      blocksTotal,
+      blocksRead,
+      blocksSkipped,
+    });
+  }
+
+  return driftCount > 0;
+}
+
+/**
+ * database.bin을 블록 단위로 스트리밍 파싱하여 capture (initial hydration).
+ * CHARACTER_WITH_CHAT 블록은 건너뛰고 메타데이터 + REMOTE 포인터만 읽는다.
+ * charIds를 반환하여 호출자가 proactive hydration을 시작할 수 있게 한다.
+ */
+export async function captureDatabaseBinStreaming(
+  db: Database.Database,
+  fsPath: string,
+): Promise<{ charIds: string[]; remoteCount: number }> {
+  const charIds: string[] = [];
+
+  const SKIP_TYPES = new Set([
+    RisuSaveType.CHARACTER_WITH_CHAT,
+    RisuSaveType.CHARACTER_WITHOUT_CHAT,
+    RisuSaveType.CHAT,
+  ]);
+
+  await streamRisuSave(fsPath, {
+    onHeader: (header) => SKIP_TYPES.has(header.type) ? 'skip' : 'read',
+    onBlock: (block) => {
+      const dataStr = block.data.toString('utf-8');
+      inTransaction(db, () => {
+        upsertBlock(db, generateId(db), block.header.name, block.header.type, 'database.bin', dataStr, block.hash);
+      });
+      if (block.header.type === RisuSaveType.REMOTE) {
+        const ptr = parseRemotePointer(block.data);
+        if (ptr) charIds.push(ptr.charId);
+      }
+      if (block.header.type === RisuSaveType.ROOT) {
+        extractUsePlainFetch(block.data);
+      }
+    },
+  });
+
+  return { charIds, remoteCount: charIds.length };
 }

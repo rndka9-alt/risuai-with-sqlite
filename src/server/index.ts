@@ -1,7 +1,7 @@
 import crypto from 'crypto';
 import http from 'http';
 import { PORT, UPSTREAM, CLIENT_ID_HEADER, REQUEST_ID_HEADER, RISU_AUTH_HEADER, FILE_PATH_HEADER, AUTH_EXEMPT_ROUTES } from './config';
-import { forwardRequest, forwardAndTee, forwardBufferAndTransform, decodeFilePath, fetchFromUpstream, readFromSaveMount, hashFromSaveMount, existsOnSaveMount } from './proxy';
+import { forwardRequest, forwardAndTee, forwardBufferAndTransform, decodeFilePath, fetchFromUpstream, readFromSaveMount, hashFromSaveMount, existsOnSaveMount, createSaveMountReadStream, saveMountPath } from './proxy';
 import { createCircuitBreaker } from './circuit-breaker';
 import {
   initDb, isDbReady, getDb, generateId,
@@ -27,7 +27,8 @@ import { compressColdStorage } from './cold-compat';
 import { writeToUpstream } from './proxy';
 import { handleWriteDatabase, handleWriteRemote } from './write-handler';
 import { handleRemoveAsset, handleRemoveFile } from './remove-handler';
-import { reconcileDatabaseBin, reconcileRemoteFile } from './reconcile';
+import { reconcileDatabaseBin, reconcileRemoteFile, reconcileDatabaseBinStreaming, captureDatabaseBinStreaming } from './reconcile';
+import { streamCharacterJson } from '../utils/streamCharacterJson';
 import { parseColumnComments } from '../utils/parseColumnComments';
 import { handleProxy2 } from './stream-buffer';
 import { getClientJs, injectScriptTag } from './client-bundle';
@@ -410,17 +411,19 @@ async function hydrateAssetBinaries(authHeader: string | undefined): Promise<voi
   });
 }
 
-/** Proactively hydrate all remotes — filesystem direct-read, sequential. */
+/** Proactively hydrate all remotes — streaming JSON parse, sequential. */
 async function proactiveHydration(charIds: string[], authHeader: string | undefined): Promise<void> {
   log.info('Proactive hydration started', { remotes: String(charIds.length) });
   const t0 = performance.now();
   let skipped = 0;
+  let streamed = 0;
+  let buffered = 0;
 
   const pending = charIds.filter((id) => !capturedRemotes.has(id));
   for (const charId of pending) {
     const filePath = `remotes/${charId}.local.bin`;
 
-    // hash-only 스트리밍으로 변경 여부 판별 — 전체 파일을 메모리에 올리지 않음
+    // hash-only 스트리밍으로 변경 여부 판별
     const existing = getCharacterByCharId(getDb(), charId);
     if (existing) {
       const fsHash = await hashFromSaveMount(filePath);
@@ -431,11 +434,23 @@ async function proactiveHydration(charIds: string[], authHeader: string | undefi
       }
     }
 
-    // 파일시스템 직접 읽기, 실패 시 HTTP fallback
-    const body = await readFromSaveMount(filePath)
-      ?? await fetchFromUpstream(filePath, authHeader);
+    // Level 2: 파일시스템 스트리밍 파싱 시도
+    const fsExists = await existsOnSaveMount(filePath);
+    if (fsExists) {
+      try {
+        await captureRemoteFileStreaming(filePath, charId, authHeader);
+        streamed++;
+        continue;
+      } catch (err) {
+        log.warn('Streaming capture failed, falling back to buffer', { charId, error: String(err) });
+      }
+    }
+
+    // Fallback: HTTP fetch → buffer 방식
+    const body = await fetchFromUpstream(filePath, authHeader);
     if (body && body.length > 0) {
       await captureRemoteFile(body, charId, authHeader);
+      buffered++;
     } else {
       log.warn('Proactive fetch failed', { charId });
     }
@@ -445,12 +460,98 @@ async function proactiveHydration(charIds: string[], authHeader: string | undefi
     ms: (performance.now() - t0).toFixed(0),
     captured: capturedRemotes.size + '/' + expectedRemoteCount,
     skipped: String(skipped),
+    streamed: String(streamed),
+    buffered: String(buffered),
   });
 
   log.info('Triggering asset hydration after proactive hydration');
   hydrateAssetBinaries(authHeader).catch((e) =>
     log.warn('Asset hydration error', { error: String(e) }),
   );
+}
+
+/**
+ * 파일시스템 ReadStream → streamCharacterJson으로 캐릭터를 스트리밍 파싱.
+ * chats를 한 개씩 처리하여 피크 메모리를 ~1MB로 제한한다.
+ */
+async function captureRemoteFileStreaming(filePath: string, charId: string, authHeader: string | undefined): Promise<void> {
+  if (!isDbReady()) return;
+  const db = getDb();
+  const t0 = performance.now();
+
+  const stream = createSaveMountReadStream(filePath);
+
+  const chatsList: unknown[] = [];
+  const { fields, hash } = await streamCharacterJson(stream, (_index, chat) => {
+    chatsList.push(chat);
+  });
+
+  const existing = getCharacterByCharId(db, charId);
+  if (existing && getCharacterHash(db, charId) === hash) {
+    capturedRemotes.add(charId);
+    hydrationState = resolveHydration();
+    return;
+  }
+
+  const wsId = existing?.__ws_id ?? generateId(db);
+
+  // chats를 빈 배열로 설정 — characterJsonToColumns는 chats를 EXCLUDED_FIELDS로 건너뜀
+  fields.chats = [];
+
+  const { columns, unknownFields } = characterJsonToColumns(fields);
+  if (unknownFields.length > 0) {
+    log.warn('Hydration: unknown character fields', { charId, fields: unknownFields.join(', ') });
+  }
+
+  const t1 = performance.now();
+
+  inTransaction(db, () => {
+    upsertCharacter(db, wsId, charId, hash, `remotes/${charId}.local.bin`, columns);
+    softDeleteAssetMapByCharacter(db, wsId);
+
+    if (typeof fields.image === 'string' && fields.image) {
+      const aid = ensureAssetMeta(db, fields.image);
+      if (aid) linkCharacterAsset(db, wsId, aid, 'image', null, null, null, 0);
+    }
+    if (Array.isArray(fields.emotionImages)) {
+      for (let i = 0; i < fields.emotionImages.length; i++) {
+        const e = fields.emotionImages[i];
+        if (!Array.isArray(e) || e.length < 2) continue;
+        const aid = ensureAssetMeta(db, e[1]);
+        if (aid) linkCharacterAsset(db, wsId, aid, 'emotionImages', e[0], null, null, i);
+      }
+    }
+    if (Array.isArray(fields.additionalAssets)) {
+      for (let i = 0; i < fields.additionalAssets.length; i++) {
+        const e = fields.additionalAssets[i];
+        if (!Array.isArray(e) || e.length < 2) continue;
+        const aid = ensureAssetMeta(db, e[1]);
+        if (aid) linkCharacterAsset(db, wsId, aid, 'additionalAssets', e[0], e[2] ?? null, null, i);
+      }
+    }
+    if (Array.isArray(fields.ccAssets)) {
+      for (let i = 0; i < fields.ccAssets.length; i++) {
+        const e = fields.ccAssets[i] as Record<string, string> | undefined;
+        if (!e?.uri) continue;
+        const aid = ensureAssetMeta(db, e.uri);
+        if (aid) linkCharacterAsset(db, wsId, aid, 'ccAssets', e.name ?? null, e.ext ?? null, e.type ?? null, i);
+      }
+    }
+
+    storeChatsDuringHydration(db, wsId, chatsList, authHeader);
+  });
+
+  const t2 = performance.now();
+
+  capturedRemotes.add(charId);
+  log.info('captureRemoteFileStreaming', {
+    charId,
+    chats: String(chatsList.length),
+    parse: (t1 - t0).toFixed(0) + 'ms',
+    sqlite: (t2 - t1).toFixed(0) + 'ms',
+    captured: capturedRemotes.size + '/' + expectedRemoteCount,
+  });
+  hydrationState = resolveHydration();
 }
 
 function captureDatabaseBin(body: Buffer, authHeader: string | undefined): void {
@@ -499,6 +600,30 @@ function captureDatabaseBin(body: Buffer, authHeader: string | undefined): void 
     proactiveHydration(charIds, authHeader)
       .catch((e) => log.error('Proactive hydration error', { error: String(e) }));
   }
+}
+
+/** database.bin을 블록 단위 스트리밍으로 capture 후 proactive hydration 시작. */
+function captureDatabaseBinViaStream(fsPath: string, authHeader: string | undefined): void {
+  if (!isDbReady()) return;
+  const db = getDb();
+
+  storedAuthHeader = authHeader;
+  expectedRemoteCount = 0;
+  capturedRemotes.clear();
+
+  captureDatabaseBinStreaming(db, fsPath).then(({ charIds, remoteCount }) => {
+    expectedRemoteCount = remoteCount;
+    hydrationState = 'WARMING';
+    log.info('database.bin captured via streaming, State: WARMING', { remotesExpected: remoteCount });
+    hydrationState = resolveHydration();
+
+    if (hydrationState !== 'HOT' && charIds.length > 0) {
+      proactiveHydration(charIds, authHeader)
+        .catch((e) => log.error('Proactive hydration error', { error: String(e) }));
+    }
+  }).catch((e) => {
+    log.error('captureDatabaseBinStreaming failed', { error: String(e) });
+  });
 }
 
 async function captureRemoteFile(body: Buffer, charId: string, authHeader: string | undefined): Promise<void> {
@@ -1137,14 +1262,20 @@ function main(): void {
             log.warn('read-database fallback to upstream', { error: err instanceof Error ? err.message : String(err) });
           }
         }
+        // database.bin이 수 GB일 수 있으므로 전체 버퍼링하지 않고 단순 프록시.
+        // reconcile/capture는 FS에서 블록 단위 스트리밍으로 수행.
         const dbAuthHeader = typeof req.headers[RISU_AUTH_HEADER] === 'string' ? req.headers[RISU_AUTH_HEADER] : undefined;
-        forwardAndTee(req, res, (status, body) => {
-          if (status < 200 || status >= 300 || body.length === 0 || !isDbReady()) return;
-          try {
-            if (hydrationState === 'HOT') reconcileDatabaseBin(getDb(), body);
-            else captureDatabaseBin(body, dbAuthHeader);
-          } catch (e) { log.error('capture/reconcile database.bin error', { error: String(e) }); }
-        });
+        forwardRequest(req, res);
+        if (isDbReady()) {
+          const dbFsPath = saveMountPath('database/database.bin');
+          (async () => {
+            if (hydrationState === 'HOT') {
+              await reconcileDatabaseBinStreaming(getDb(), dbFsPath);
+            } else {
+              captureDatabaseBinViaStream(dbFsPath, dbAuthHeader);
+            }
+          })().catch((e) => { log.error('streaming database.bin reconcile error', { error: String(e) }); });
+        }
         return;
       }
 
@@ -1160,30 +1291,30 @@ function main(): void {
             log.warn('read-remote fallback to upstream', { charId: route.charId, error: err instanceof Error ? err.message : String(err) });
           }
         }
+        // 대형 캐릭터 파일을 전체 버퍼링하지 않고 단순 프록시.
+        // reconcile/capture는 FS 마운트에서 비동기로 수행.
         const remoteAuthHeader = typeof req.headers[RISU_AUTH_HEADER] === 'string' ? req.headers[RISU_AUTH_HEADER] : undefined;
-        if (isDbReady() && hydrationState !== 'HOT') {
-          // COLD/WARMING: buffer → slim → serve optimized data to client
-          forwardBufferAndTransform(req, res, async (status, _headers, body) => {
-            if (status < 200 || status >= 300 || body.length === 0) return null;
-            try {
-              await captureRemoteFile(body, route.charId, remoteAuthHeader);
-              // characters 테이블에서 slim JSON 생성하여 응답
-              const db = getDb();
-              const charRow = getCharacterByCharId(db, route.charId);
-              if (charRow) {
-                log.debug('Serving slimmed remote during hydration', { charId: route.charId });
-                return Buffer.from(buildSlimJson(charRow), 'utf-8');
+        forwardRequest(req, res);
+        if (isDbReady()) {
+          const charId = route.charId;
+          const filePath = `remotes/${charId}.local.bin`;
+          (async () => {
+            if (hydrationState !== 'HOT') {
+              const fsExists = await existsOnSaveMount(filePath);
+              if (fsExists) {
+                await captureRemoteFileStreaming(filePath, charId, remoteAuthHeader);
+              } else {
+                const body = await fetchFromUpstream(filePath, remoteAuthHeader);
+                if (body && body.length > 0) await captureRemoteFile(body, charId, remoteAuthHeader);
               }
-            } catch (e) { log.error('capture remote error during hydration', { charId: route.charId, error: String(e) }); }
-            return null; // fallback to original body
-          });
-        } else {
-          // HOT bypass (reconcile) or DB not ready: tee as before
-          forwardAndTee(req, res, (status, body) => {
-            if (status < 200 || status >= 300 || body.length === 0 || !isDbReady()) return;
-            reconcileRemoteFile(getDb(), body, route.charId, remoteAuthHeader)
-              .catch((e) => { log.error('reconcile remote error', { charId: route.charId, error: String(e) }); });
-          });
+            } else {
+              const body = await readFromSaveMount(filePath)
+                ?? await fetchFromUpstream(filePath, remoteAuthHeader);
+              if (body && body.length > 0) {
+                await reconcileRemoteFile(getDb(), body, charId, remoteAuthHeader);
+              }
+            }
+          })().catch((e) => { log.error('async capture/reconcile remote error', { charId, error: String(e) }); });
         }
         return;
       }
@@ -1549,45 +1680,27 @@ function main(): void {
       // 2. Hydrate .meta lastUsed
       await hydrateMissingMetaLastUsed(getDb(), token);
 
-      // 3. Hydrate database.bin → blocks + remotes (self-auth 전용 동기 흐름)
-      const dbBody = await fetchFromUpstream('database/database.bin', token);
-      if (dbBody && dbBody.length > 0) {
-        // captureDatabaseBin의 block 저장 부분만 실행 (proactive는 직접 await)
-        const result = parseRisuSave(dbBody);
-        if (result) {
-          const charIds: string[] = [];
-          expectedRemoteCount = 0;
-          capturedRemotes.clear();
+      // 3. Hydrate database.bin → blocks + remotes (블록 단위 스트리밍)
+      const dbFsPath = saveMountPath('database/database.bin');
+      try {
+        expectedRemoteCount = 0;
+        capturedRemotes.clear();
 
-          inTransaction(getDb(), () => {
-            for (const block of result.blocks) {
-              const dataStr = block.data.toString('utf-8');
-              upsertBlock(getDb(), generateId(getDb()), block.name, block.type, 'database.bin', dataStr, block.hash);
-              if (block.type === RisuSaveType.REMOTE) {
-                const ptr = parseRemotePointer(block.data);
-                if (ptr) {
-                  expectedRemoteCount++;
-                  charIds.push(ptr.charId);
-                }
-              }
-              if (block.type === RisuSaveType.ROOT) {
-                extractUsePlainFetch(block.data);
-              }
-            }
-          });
+        const { charIds, remoteCount } = await captureDatabaseBinStreaming(getDb(), dbFsPath);
+        expectedRemoteCount = remoteCount;
 
-          hydrationState = 'WARMING';
-          log.info('database.bin captured (self-auth)', { blocks: result.blocks.length, remotes: expectedRemoteCount });
+        hydrationState = 'WARMING';
+        log.info('database.bin captured (self-auth, streaming)', { remotes: remoteCount });
 
-          // proactiveHydration을 await로 직접 대기
-          await proactiveHydration(charIds, token);
-          hydrationState = resolveHydration();
+        await proactiveHydration(charIds, token);
+        hydrationState = resolveHydration();
 
-          log.info('Self-auth hydration done', {
-            state: hydrationState,
-            captured: capturedRemotes.size + '/' + expectedRemoteCount,
-          });
-        }
+        log.info('Self-auth hydration done', {
+          state: hydrationState,
+          captured: capturedRemotes.size + '/' + expectedRemoteCount,
+        });
+      } catch (e) {
+        log.error('Self-auth database.bin streaming failed', { error: String(e) });
       }
 
       // 4. Asset hydration은 proactiveHydration 끝에서 자동 실행
