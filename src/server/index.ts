@@ -1137,14 +1137,15 @@ function main(): void {
       case 'read-coldstorage': {
         const canAccelerate = isDbReady() && cb.allowRequest();
         if (canAccelerate) {
-          try {
-            handleReadColdStorage(req, res, route.key);
-            cb.onSuccess();
-            return;
-          } catch (err) {
-            cb.onFailure();
-            log.warn('read-coldstorage fallback to upstream', { key: route.key, error: err instanceof Error ? err.message : String(err) });
-          }
+          handleReadColdStorage(req, res, route.key).then(
+            () => { cb.onSuccess(); },
+            (err) => {
+              cb.onFailure();
+              log.warn('read-coldstorage fallback to upstream', { key: route.key, error: err instanceof Error ? err.message : String(err) });
+              forwardRequest(req, res);
+            },
+          );
+          return;
         }
         forwardRequest(req, res);
         return;
@@ -1152,8 +1153,11 @@ function main(): void {
 
       case 'write-database': {
         if (isDbReady()) {
-          try { handleWriteDatabase(req, res, getDb()); return; }
-          catch (err) { log.warn('write-database error, bypassing', { error: err instanceof Error ? err.message : String(err) }); }
+          handleWriteDatabase(req, res, getDb()).catch((err) => {
+            log.warn('write-database error, bypassing', { error: err instanceof Error ? err.message : String(err) });
+            forwardRequest(req, res);
+          });
+          return;
         }
         forwardRequest(req, res);
         return;
@@ -1161,8 +1165,11 @@ function main(): void {
 
       case 'write-remote': {
         if (isDbReady()) {
-          try { handleWriteRemote(req, res, route.charId, getDb()); return; }
-          catch (err) { log.warn('write-remote error, bypassing', { charId: route.charId, error: err instanceof Error ? err.message : String(err) }); }
+          handleWriteRemote(req, res, route.charId, getDb()).catch((err) => {
+            log.warn('write-remote error, bypassing', { charId: route.charId, error: err instanceof Error ? err.message : String(err) });
+            forwardRequest(req, res);
+          });
+          return;
         }
         forwardRequest(req, res);
         return;
