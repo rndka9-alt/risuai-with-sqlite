@@ -183,6 +183,8 @@ function reconcileChats(
       folder_id: chat.folderId ?? null,
       last_date: chat.lastDate ?? null,
       fm_index: chat.fmIndex ?? null,
+      note: chat.note ?? '',
+      chat_name: chat.name ?? '',
       bookmarks: JSON.stringify(chat.bookmarks ?? []),
       bookmark_names: JSON.stringify(chat.bookmarkNames ?? {}),
     };

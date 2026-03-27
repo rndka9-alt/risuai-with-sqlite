@@ -34,7 +34,8 @@ import * as log from './logger';
 import { RisuSaveType, toRisuSaveType, type HydrationState } from '../shared/types';
 import { getUsePlainFetch, extractUsePlainFetch } from './proxy-config-state';
 import { initAuth, isAuthReady, issueInternalToken, verifyClientAuth } from './auth';
-import { startPeriodicSync } from './periodic-sync';
+import { startPeriodicSync, runSync } from './periodic-sync';
+import type { SyncResult } from './periodic-sync';
 import { dbMigrate } from './dbMigrate';
 
 // --- Route classification ---
@@ -65,6 +66,8 @@ type Route =
   | { type: 'internal-sql-tables' }
   | { type: 'internal-sql-schema'; table: string }
   | { type: 'internal-sql-query' }
+  | { type: 'internal-sync-status' }
+  | { type: 'internal-sync-trigger' }
   | { type: 'passthrough' };
 
 function classifyRequest(req: http.IncomingMessage): Route {
@@ -114,6 +117,12 @@ function classifyRequest(req: http.IncomingMessage): Route {
   }
   if (url === '/_internal/sql/query' && req.method === 'POST') {
     return { type: 'internal-sql-query' };
+  }
+  if (url === '/_internal/sync/status' && req.method === 'GET') {
+    return { type: 'internal-sync-status' };
+  }
+  if (url === '/_internal/sync/trigger' && req.method === 'POST') {
+    return { type: 'internal-sync-trigger' };
   }
 
   // Root HTML (for script injection)
@@ -259,6 +268,8 @@ function buildSlimJson(row: Record<string, unknown>): string {
       folderId: s.folder_id,
       lastDate: s.last_date,
       fmIndex: s.fm_index,
+      note: s.note ?? '',
+      name: s.chat_name ?? '',
       bookmarks: tryParse(s.bookmarks),
       bookmarkNames: tryParse(s.bookmark_names),
     }));
@@ -1416,6 +1427,38 @@ function main(): void {
             res.end(JSON.stringify({ error: message }));
           }
         });
+        return;
+      }
+
+      case 'internal-sync-status': {
+        const payload = JSON.stringify({
+          hydrationState,
+          capturedRemotes: capturedRemotes.size,
+          expectedRemotes: expectedRemoteCount,
+          dbReady: isDbReady(),
+        });
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(payload);
+        return;
+      }
+
+      case 'internal-sync-trigger': {
+        if (!isDbReady()) {
+          res.writeHead(503, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'DB not ready' }));
+          return;
+        }
+        runSync(getDb)
+          .then((result: SyncResult) => {
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify(result));
+          })
+          .catch((err: unknown) => {
+            const message = err instanceof Error ? err.message : String(err);
+            log.error('Manual sync failed', { error: message });
+            res.writeHead(500, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ error: message }));
+          });
         return;
       }
 

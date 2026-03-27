@@ -30,16 +30,26 @@ export function startPeriodicSync(getDb: () => Database.Database): void {
   log.info('Periodic sync scheduled', { intervalHours: 24 });
 }
 
-async function runSync(getDb: () => Database.Database): Promise<void> {
+export interface SyncResult {
+  filesAdded: number;
+  filesRemoved: number;
+  metaUpdated: number;
+  dbBinDrift: boolean;
+  remotesUpdated: number;
+  elapsedMs: number;
+  skipped?: string;
+}
+
+export async function runSync(getDb: () => Database.Database): Promise<SyncResult> {
   if (!isAuthReady()) {
     log.warn('Periodic sync skipped — auth not ready');
-    return;
+    return { filesAdded: 0, filesRemoved: 0, metaUpdated: 0, dbBinDrift: false, remotesUpdated: 0, elapsedMs: 0, skipped: 'auth not ready' };
   }
 
   const token = await issueInternalToken();
   if (!token) {
     log.warn('Periodic sync skipped — cannot issue token');
-    return;
+    return { filesAdded: 0, filesRemoved: 0, metaUpdated: 0, dbBinDrift: false, remotesUpdated: 0, elapsedMs: 0, skipped: 'cannot issue token' };
   }
 
   const db = getDb();
@@ -58,13 +68,22 @@ async function runSync(getDb: () => Database.Database): Promise<void> {
   // 4. Remote character reconciliation
   const remoteDrift = await syncRemotes(db, token);
 
-  const ms = (performance.now() - t0).toFixed(0);
+  const elapsed = Math.round(performance.now() - t0);
   const hasDrift = fileListDrift.added > 0 || fileListDrift.removed > 0
     || metaDrift > 0 || dbDrift || remoteDrift > 0;
 
+  const result: SyncResult = {
+    filesAdded: fileListDrift.added,
+    filesRemoved: fileListDrift.removed,
+    metaUpdated: metaDrift,
+    dbBinDrift: dbDrift,
+    remotesUpdated: remoteDrift,
+    elapsedMs: elapsed,
+  };
+
   if (hasDrift) {
     log.warn('Periodic sync found drift', {
-      ms,
+      ms: String(elapsed),
       filesAdded: fileListDrift.added,
       filesRemoved: fileListDrift.removed,
       metaUpdated: metaDrift,
@@ -72,8 +91,10 @@ async function runSync(getDb: () => Database.Database): Promise<void> {
       remotesUpdated: remoteDrift,
     });
   } else {
-    log.info('Periodic sync complete — no drift', { ms });
+    log.info('Periodic sync complete — no drift', { ms: String(elapsed) });
   }
+
+  return result;
 }
 
 async function syncFileList(

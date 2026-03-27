@@ -457,6 +457,46 @@ CREATE TABLE IF NOT EXISTS chat_sessions (
   -- 이 세션에서 사용 중인 firstMessage 인덱스.
   fm_index          INTEGER,
 
+  -- Chat.note
+  -- 채팅 세션의 메모. 사용자가 작성하는 자유 텍스트.
+  note              TEXT DEFAULT '',
+
+  -- Chat.name
+  -- 채팅 세션 이름. e.g. 'Chat 1', 'Chat 2'.
+  chat_name         TEXT DEFAULT '',
+
+  -- Chat.id
+  -- 채팅 세션 고유 식별자. sync 서버의 chat merge에서 매칭 키로 사용.
+  chat_id           TEXT,
+
+  -- Chat.sdData
+  -- Stable Diffusion 관련 데이터.
+  sd_data           TEXT,
+
+  -- Chat.supaMemoryData
+  -- 레거시 장기 메모리 데이터 (Supa Memory).
+  supa_memory_data  TEXT,
+
+  -- Chat.lastMemory
+  -- 레거시 마지막 메모리 요약 텍스트.
+  last_memory       TEXT,
+
+  -- Chat.suggestMessages
+  -- AI가 제안한 다음 메시지 목록. JSON string[].
+  suggest_messages  TEXT DEFAULT '[]',
+
+  -- Chat.isStreaming
+  -- 현재 스트리밍 중인지 여부. 런타임 상태.
+  is_streaming      INTEGER DEFAULT 0,
+
+  -- Chat.modules
+  -- 이 세션에서 활성화된 모듈 ID 목록. JSON string[].
+  modules           TEXT DEFAULT '[]',
+
+  -- Chat.bindedPersona
+  -- 이 세션에 바인딩된 페르소나 ID.
+  binded_persona    TEXT,
+
   -- Chat.bookmarks
   -- 북마크된 메시지 ID 배열. JSON string[].
   bookmarks         TEXT DEFAULT '[]',
