@@ -6,7 +6,7 @@
  */
 
 import type Database from 'better-sqlite3';
-import { fetchFromUpstream } from './proxy';
+import { fetchFromUpstream, readFromSaveMount } from './proxy';
 import { populateFileListCache, getFileListCache, upsertMetaLastUsed, getMetaEntries, getMetaMissingLastUsed } from './db';
 import { reconcileDatabaseBin, reconcileRemoteFile } from './reconcile';
 import { parseRisuSave, parseRemotePointer } from './parser';
@@ -174,7 +174,8 @@ async function syncDatabaseBin(
   db: Database.Database,
   token: string,
 ): Promise<{ drifted: boolean; body: Buffer | null }> {
-  const body = await fetchFromUpstream('database/database.bin', token);
+  const body = await readFromSaveMount('database/database.bin')
+    ?? await fetchFromUpstream('database/database.bin', token);
   if (!body || body.length === 0) return { drifted: false, body: null };
   const drifted = reconcileDatabaseBin(db, Buffer.from(body));
   return { drifted, body };
@@ -201,16 +202,15 @@ async function syncRemotes(
   }
 
   let updated = 0;
-  for (let i = 0; i < charIds.length; i += SYNC_CONCURRENCY) {
-    const batch = charIds.slice(i, i + SYNC_CONCURRENCY);
-    await Promise.all(batch.map(async (charId) => {
-      try {
-        const body = await fetchFromUpstream(`remotes/${charId}.local.bin`, token);
-        if (!body || body.length === 0) return;
-        const drifted = await reconcileRemoteFile(db, Buffer.from(body), charId, token);
-        if (drifted) updated++;
-      } catch { /* skip */ }
-    }));
+  for (const charId of charIds) {
+    try {
+      const filePath = `remotes/${charId}.local.bin`;
+      const body = await readFromSaveMount(filePath)
+        ?? await fetchFromUpstream(filePath, token);
+      if (!body || body.length === 0) continue;
+      const drifted = await reconcileRemoteFile(db, Buffer.from(body), charId, token);
+      if (drifted) updated++;
+    } catch { /* skip */ }
   }
 
   if (updated > 0) {

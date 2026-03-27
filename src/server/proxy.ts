@@ -1,5 +1,10 @@
 import http from 'http';
-import { UPSTREAM, FILE_PATH_HEADER, REQUEST_ID_HEADER, RISU_AUTH_HEADER } from './config';
+import { createReadStream } from 'fs';
+import { readFile, access } from 'fs/promises';
+import { constants as fsConstants } from 'fs';
+import path from 'path';
+import crypto from 'crypto';
+import { UPSTREAM, FILE_PATH_HEADER, REQUEST_ID_HEADER, RISU_AUTH_HEADER, RISUAI_SAVE_MOUNT } from './config';
 import * as log from './logger';
 
 /** Decode hex-encoded file-path header to UTF-8 string */
@@ -307,6 +312,44 @@ export function bufferBody(req: http.IncomingMessage): Promise<Buffer> {
     req.on('data', (chunk: Buffer) => chunks.push(chunk));
     req.on('end', () => resolve(Buffer.concat(chunks)));
     req.on('error', reject);
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Filesystem direct-read (via /risuai-save mount)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function saveMountPath(filePath: string): string {
+  return path.join(RISUAI_SAVE_MOUNT, encodeFilePath(filePath));
+}
+
+/** Check if a file exists on the save mount. */
+export async function existsOnSaveMount(filePath: string): Promise<boolean> {
+  try {
+    await access(saveMountPath(filePath), fsConstants.R_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Read a file from the save mount. Returns null if not found. */
+export async function readFromSaveMount(filePath: string): Promise<Buffer | null> {
+  try {
+    return await readFile(saveMountPath(filePath));
+  } catch {
+    return null;
+  }
+}
+
+/** Stream-compute SHA-256 hash of a file on the save mount without buffering. */
+export function hashFromSaveMount(filePath: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    const stream = createReadStream(saveMountPath(filePath));
+    const hash = crypto.createHash('sha256');
+    stream.on('data', (chunk) => hash.update(chunk));
+    stream.on('end', () => resolve(hash.digest('hex')));
+    stream.on('error', () => resolve(null));
   });
 }
 

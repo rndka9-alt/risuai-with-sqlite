@@ -1,12 +1,12 @@
 import crypto from 'crypto';
 import http from 'http';
 import { PORT, UPSTREAM, CLIENT_ID_HEADER, REQUEST_ID_HEADER, RISU_AUTH_HEADER, FILE_PATH_HEADER, AUTH_EXEMPT_ROUTES } from './config';
-import { forwardRequest, forwardAndTee, forwardBufferAndTransform, decodeFilePath, fetchFromUpstream } from './proxy';
+import { forwardRequest, forwardAndTee, forwardBufferAndTransform, decodeFilePath, fetchFromUpstream, readFromSaveMount, hashFromSaveMount, existsOnSaveMount } from './proxy';
 import { createCircuitBreaker } from './circuit-breaker';
 import {
   initDb, isDbReady, getDb, generateId,
   getBlockByName, getBlocksBySource, upsertBlock,
-  getCharacterByCharId, getAllCharacterIds, upsertCharacter,
+  getCharacterByCharId, getCharacterHash, getAllCharacterIds, upsertCharacter,
   characterJsonToColumns, characterColumnsToJson,
   getChatSessionByUuid, getChatSessionsByCharacter,
   getChatMessagesBySession, upsertChatSession, insertChatMessages,
@@ -410,28 +410,43 @@ async function hydrateAssetBinaries(authHeader: string | undefined): Promise<voi
   });
 }
 
-/** Proactively fetch all remotes from upstream after database.bin is captured. */
+/** Proactively hydrate all remotes — filesystem direct-read, sequential. */
 async function proactiveHydration(charIds: string[], authHeader: string | undefined): Promise<void> {
   log.info('Proactive hydration started', { remotes: String(charIds.length) });
   const t0 = performance.now();
+  let skipped = 0;
 
-  const CONCURRENCY = 10;
   const pending = charIds.filter((id) => !capturedRemotes.has(id));
-  for (let i = 0; i < pending.length; i += CONCURRENCY) {
-    const batch = pending.slice(i, i + CONCURRENCY);
-    await Promise.all(batch.map(async (charId) => {
-      const body = await fetchFromUpstream(`remotes/${charId}.local.bin`, authHeader);
-      if (body && body.length > 0) {
-        await captureRemoteFile(body, charId, authHeader);
-      } else {
-        log.warn('Proactive fetch failed', { charId });
+  for (const charId of pending) {
+    const filePath = `remotes/${charId}.local.bin`;
+
+    // hash-only 스트리밍으로 변경 여부 판별 — 전체 파일을 메모리에 올리지 않음
+    const existing = getCharacterByCharId(getDb(), charId);
+    if (existing) {
+      const fsHash = await hashFromSaveMount(filePath);
+      if (fsHash && getCharacterHash(getDb(), charId) === fsHash) {
+        capturedRemotes.add(charId);
+        skipped++;
+        continue;
       }
-    }));
+    }
+
+    // 파일시스템 직접 읽기, 실패 시 HTTP fallback
+    const body = await readFromSaveMount(filePath)
+      ?? await fetchFromUpstream(filePath, authHeader);
+    if (body && body.length > 0) {
+      await captureRemoteFile(body, charId, authHeader);
+    } else {
+      log.warn('Proactive fetch failed', { charId });
+    }
   }
 
-  log.info('Proactive hydration finished', { ms: (performance.now() - t0).toFixed(0), captured: capturedRemotes.size + '/' + expectedRemoteCount });
+  log.info('Proactive hydration finished', {
+    ms: (performance.now() - t0).toFixed(0),
+    captured: capturedRemotes.size + '/' + expectedRemoteCount,
+    skipped: String(skipped),
+  });
 
-  // 캐릭터 hydration 후 바로 에셋 바이너리 fetch
   log.info('Triggering asset hydration after proactive hydration');
   hydrateAssetBinaries(authHeader).catch((e) =>
     log.warn('Asset hydration error', { error: String(e) }),
@@ -499,6 +514,10 @@ async function captureRemoteFile(body: Buffer, charId: string, authHeader: strin
   const existing = getCharacterByCharId(db, charId);
   const wsId = existing?.__ws_id ?? generateId(db);
 
+  // chats를 추출 후 원본 객체에서 제거 — GC가 charObj 본체를 빨리 수거할 수 있도록
+  const chats = charObj.chats;
+  charObj.chats = [];
+
   const { columns, unknownFields } = characterJsonToColumns(charObj);
   if (unknownFields.length > 0) {
     log.warn('Hydration: unknown character fields', { charId, fields: unknownFields.join(', ') });
@@ -509,7 +528,6 @@ async function captureRemoteFile(body: Buffer, charId: string, authHeader: strin
   inTransaction(db, () => {
     upsertCharacter(db, wsId, charId, hash, `remotes/${charId}.local.bin`, columns);
     softDeleteAssetMapByCharacter(db, wsId);
-    // 에셋 메타 등록 (inline)
     if (typeof charObj.image === 'string' && charObj.image) {
       const aid = ensureAssetMeta(db, charObj.image);
       if (aid) linkCharacterAsset(db, wsId, aid, 'image', null, null, null, 0);
@@ -539,8 +557,7 @@ async function captureRemoteFile(body: Buffer, charId: string, authHeader: strin
       }
     }
 
-    // 채팅 정규화
-    storeChatsDuringHydration(db, wsId, charObj.chats, authHeader);
+    storeChatsDuringHydration(db, wsId, chats, authHeader);
   });
 
   const t2 = performance.now();
