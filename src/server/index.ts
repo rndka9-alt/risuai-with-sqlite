@@ -28,6 +28,7 @@ import { writeToUpstream } from './proxy';
 import { handleWriteDatabase, handleWriteRemote } from './write-handler';
 import { handleRemoveAsset, handleRemoveFile } from './remove-handler';
 import { reconcileDatabaseBin, reconcileRemoteFile } from './reconcile';
+import { parseColumnComments } from '../utils/parseColumnComments';
 import { handleProxy2 } from './stream-buffer';
 import { getClientJs, injectScriptTag } from './client-bundle';
 import * as log from './logger';
@@ -270,6 +271,14 @@ function buildSlimJson(row: Record<string, unknown>): string {
       fmIndex: s.fm_index,
       note: s.note ?? '',
       name: s.chat_name ?? '',
+      id: s.chat_id ?? undefined,
+      sdData: s.sd_data ?? undefined,
+      supaMemoryData: s.supa_memory_data ?? undefined,
+      lastMemory: s.last_memory ?? undefined,
+      suggestMessages: tryParse(s.suggest_messages),
+      isStreaming: s.is_streaming ? true : undefined,
+      modules: tryParse(s.modules),
+      bindedPersona: s.binded_persona ?? undefined,
       bookmarks: tryParse(s.bookmarks),
       bookmarkNames: tryParse(s.bookmark_names),
     }));
@@ -1330,27 +1339,33 @@ function main(): void {
         }
         const db = getDb();
         const tableName = route.table;
-        // 테이블 존재 확인
-        const exists = db.prepare(
-          "SELECT 1 FROM sqlite_master WHERE name = ? AND type IN ('table', 'view')",
-        ).get(tableName);
-        if (!exists) {
+        const escapedName = tableName.replace(/"/g, '""');
+        // 테이블 존재 확인 + DDL 원문 (주석 포함)
+        const masterRow = db.prepare(
+          "SELECT sql FROM sqlite_master WHERE name = ? AND type IN ('table', 'view')",
+        ).get(tableName) as { sql: string } | undefined;
+        if (!masterRow) {
           res.writeHead(404, { 'content-type': 'application/json' });
           res.end(JSON.stringify({ error: `Table not found: ${tableName}` }));
           return;
         }
-        const columns = db.prepare(`PRAGMA table_info("${tableName.replace(/"/g, '""')}")`).all() as Array<{
+        const commentMap = parseColumnComments(masterRow.sql);
+        const columns = db.prepare(`PRAGMA table_info("${escapedName}")`).all() as Array<{
           cid: number; name: string; type: string; notnull: number; dflt_value: string | null; pk: number;
         }>;
-        const indexRows = db.prepare(`PRAGMA index_list("${tableName.replace(/"/g, '""')}")`).all() as Array<{
+        const columnsWithComments = columns.map((col) => ({
+          ...col,
+          comment: commentMap.get(col.name) ?? null,
+        }));
+        const indexRows = db.prepare(`PRAGMA index_list("${escapedName}")`).all() as Array<{
           seq: number; name: string; unique: number;
         }>;
         const rowCountRow = db.prepare(
-          `SELECT COUNT(*) as count FROM "${tableName.replace(/"/g, '""')}"`,
+          `SELECT COUNT(*) as count FROM "${escapedName}"`,
         ).get() as { count: number };
         const payload = JSON.stringify({
           table: tableName,
-          columns,
+          columns: columnsWithComments,
           indexes: indexRows,
           rowCount: rowCountRow.count,
         });
