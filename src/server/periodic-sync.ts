@@ -16,6 +16,7 @@ import * as log from './logger';
 
 const SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
 const REACTIVE_SYNC_COOLDOWN_MS = 60_000; // 1 minute
+const SYNC_CONCURRENCY = 10;
 
 let timer: ReturnType<typeof setInterval> | null = null;
 let lastReactiveSync = 0;
@@ -62,11 +63,11 @@ export async function runSync(getDb: () => Database.Database): Promise<SyncResul
   // 2. .meta lastUsed sync
   const metaDrift = await syncMeta(db, token);
 
-  // 3. database.bin reconciliation
-  const dbDrift = await syncDatabaseBin(db, token);
+  // 3. database.bin reconciliation (결과를 syncRemotes에서 재사용)
+  const { drifted: dbDrift, body: dbBinBody } = await syncDatabaseBin(db, token);
 
   // 4. Remote character reconciliation
-  const remoteDrift = await syncRemotes(db, token);
+  const remoteDrift = await syncRemotes(db, token, dbBinBody);
 
   const elapsed = Math.round(performance.now() - t0);
   const hasDrift = fileListDrift.added > 0 || fileListDrift.removed > 0
@@ -129,35 +130,39 @@ async function syncMeta(
   db: Database.Database,
   token: string,
 ): Promise<number> {
-  // Re-read all .meta files to catch stale lastUsed values
   const entries = getMetaEntries(db);
   let updated = 0;
 
-  await Promise.all(entries.map(async (entry) => {
-    try {
-      const body = await fetchFromUpstream(entry.path, token);
-      if (!body || body.length === 0) return;
-      const parsed: { lastUsed?: number } = JSON.parse(body.toString('utf-8'));
-      if (typeof parsed.lastUsed === 'number' && parsed.lastUsed !== entry.lastUsed) {
-        upsertMetaLastUsed(db, entry.path, parsed.lastUsed);
-        updated++;
-      }
-    } catch { /* skip */ }
-  }));
+  for (let i = 0; i < entries.length; i += SYNC_CONCURRENCY) {
+    const batch = entries.slice(i, i + SYNC_CONCURRENCY);
+    await Promise.all(batch.map(async (entry) => {
+      try {
+        const body = await fetchFromUpstream(entry.path, token);
+        if (!body || body.length === 0) return;
+        const parsed: { lastUsed?: number } = JSON.parse(body.toString('utf-8'));
+        if (typeof parsed.lastUsed === 'number' && parsed.lastUsed !== entry.lastUsed) {
+          upsertMetaLastUsed(db, entry.path, parsed.lastUsed);
+          updated++;
+        }
+      } catch { /* skip */ }
+    }));
+  }
 
-  // Also pick up any new .meta files
   const missing = getMetaMissingLastUsed(db);
-  await Promise.all(missing.map(async (metaPath) => {
-    try {
-      const body = await fetchFromUpstream(metaPath, token);
-      if (!body || body.length === 0) return;
-      const parsed: { lastUsed?: number } = JSON.parse(body.toString('utf-8'));
-      if (typeof parsed.lastUsed === 'number') {
-        upsertMetaLastUsed(db, metaPath, parsed.lastUsed);
-        updated++;
-      }
-    } catch { /* skip */ }
-  }));
+  for (let i = 0; i < missing.length; i += SYNC_CONCURRENCY) {
+    const batch = missing.slice(i, i + SYNC_CONCURRENCY);
+    await Promise.all(batch.map(async (metaPath) => {
+      try {
+        const body = await fetchFromUpstream(metaPath, token);
+        if (!body || body.length === 0) return;
+        const parsed: { lastUsed?: number } = JSON.parse(body.toString('utf-8'));
+        if (typeof parsed.lastUsed === 'number') {
+          upsertMetaLastUsed(db, metaPath, parsed.lastUsed);
+          updated++;
+        }
+      } catch { /* skip */ }
+    }));
+  }
 
   if (updated > 0) {
     log.warn('.meta drift detected', { updated });
@@ -168,21 +173,23 @@ async function syncMeta(
 async function syncDatabaseBin(
   db: Database.Database,
   token: string,
-): Promise<boolean> {
+): Promise<{ drifted: boolean; body: Buffer | null }> {
   const body = await fetchFromUpstream('database/database.bin', token);
-  if (!body || body.length === 0) return false;
-  return reconcileDatabaseBin(db, Buffer.from(body));
+  if (!body || body.length === 0) return { drifted: false, body: null };
+  const drifted = reconcileDatabaseBin(db, Buffer.from(body));
+  return { drifted, body };
 }
 
 async function syncRemotes(
   db: Database.Database,
   token: string,
+  dbBinBody: Buffer | null,
 ): Promise<number> {
-  // Get current character list from database.bin blocks
-  const dbBody = await fetchFromUpstream('database/database.bin', token);
-  if (!dbBody || dbBody.length === 0) return 0;
+  // syncDatabaseBin에서 이미 fetch한 결과를 재사용
+  const buf = dbBinBody ?? await fetchFromUpstream('database/database.bin', token);
+  if (!buf || buf.length === 0) return 0;
 
-  const result = parseRisuSave(Buffer.from(dbBody));
+  const result = parseRisuSave(Buffer.from(buf));
   if (!result) return 0;
 
   const charIds: string[] = [];
@@ -194,14 +201,17 @@ async function syncRemotes(
   }
 
   let updated = 0;
-  await Promise.all(charIds.map(async (charId) => {
-    try {
-      const body = await fetchFromUpstream(`remotes/${charId}.local.bin`, token);
-      if (!body || body.length === 0) return;
-      const drifted = await reconcileRemoteFile(db, Buffer.from(body), charId, token);
-      if (drifted) updated++;
-    } catch { /* skip */ }
-  }));
+  for (let i = 0; i < charIds.length; i += SYNC_CONCURRENCY) {
+    const batch = charIds.slice(i, i + SYNC_CONCURRENCY);
+    await Promise.all(batch.map(async (charId) => {
+      try {
+        const body = await fetchFromUpstream(`remotes/${charId}.local.bin`, token);
+        if (!body || body.length === 0) return;
+        const drifted = await reconcileRemoteFile(db, Buffer.from(body), charId, token);
+        if (drifted) updated++;
+      } catch { /* skip */ }
+    }));
+  }
 
   if (updated > 0) {
     log.warn('Remote character drift detected', { updated, total: charIds.length });

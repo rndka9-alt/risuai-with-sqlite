@@ -415,17 +415,19 @@ async function proactiveHydration(charIds: string[], authHeader: string | undefi
   log.info('Proactive hydration started', { remotes: String(charIds.length) });
   const t0 = performance.now();
 
-  await Promise.all(
-    charIds.map(async (charId) => {
-      if (capturedRemotes.has(charId)) return;
+  const CONCURRENCY = 10;
+  const pending = charIds.filter((id) => !capturedRemotes.has(id));
+  for (let i = 0; i < pending.length; i += CONCURRENCY) {
+    const batch = pending.slice(i, i + CONCURRENCY);
+    await Promise.all(batch.map(async (charId) => {
       const body = await fetchFromUpstream(`remotes/${charId}.local.bin`, authHeader);
       if (body && body.length > 0) {
         await captureRemoteFile(body, charId, authHeader);
       } else {
         log.warn('Proactive fetch failed', { charId });
       }
-    }),
-  );
+    }));
+  }
 
   log.info('Proactive hydration finished', { ms: (performance.now() - t0).toFixed(0), captured: capturedRemotes.size + '/' + expectedRemoteCount });
 
