@@ -11,7 +11,7 @@ import { populateFileListCache, getFileListCache, upsertMetaLastUsed, getMetaEnt
 import { reconcileDatabaseBin, reconcileRemoteFile, reconcileDatabaseBinStreaming } from './reconcile';
 import { parseRisuSave, parseRemotePointer } from './parser';
 import { streamRisuSave } from '../utils/streamRisuSave';
-import { issueInternalToken, isAuthReady } from './auth';
+import { issueInternalToken, isAuthReady, retryAuth } from './auth';
 import { RisuSaveType } from '../shared/types';
 import * as log from './logger';
 
@@ -44,8 +44,11 @@ export interface SyncResult {
 
 export async function runSync(getDb: () => Database.Database): Promise<SyncResult> {
   if (!isAuthReady()) {
-    log.warn('Periodic sync skipped — auth not ready');
-    return { filesAdded: 0, filesRemoved: 0, metaUpdated: 0, dbBinDrift: false, remotesUpdated: 0, elapsedMs: 0, skipped: 'auth not ready' };
+    await retryAuth();
+    if (!isAuthReady()) {
+      log.warn('Periodic sync skipped — auth not ready');
+      return { filesAdded: 0, filesRemoved: 0, metaUpdated: 0, dbBinDrift: false, remotesUpdated: 0, elapsedMs: 0, skipped: 'auth not ready' };
+    }
   }
 
   const token = await issueInternalToken();
@@ -233,6 +236,7 @@ export function requestFileListReconciliation(db: Database.Database): void {
   log.info('Reactive file list reconciliation triggered');
 
   (async () => {
+    if (!isAuthReady()) await retryAuth();
     if (!isAuthReady()) return;
     const token = await issueInternalToken();
     if (!token) return;

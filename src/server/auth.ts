@@ -50,38 +50,42 @@ export async function initAuth(): Promise<void> {
   await registerWithRetry(password);
 }
 
+async function registerOnce(password: string): Promise<boolean> {
+  try {
+    const body = JSON.stringify({
+      password,
+      publicKey: publicKeyJwk,
+    });
+
+    const resp = await fetch(`${UPSTREAM.protocol}//${UPSTREAM.host}/api/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body,
+    });
+
+    if (resp.ok) {
+      registered = true;
+      log.info('Self-auth registered with risuai');
+      return true;
+    }
+
+    const errBody = await resp.text();
+    log.warn('Self-auth registration failed', { status: resp.status, body: errBody });
+  } catch (err) {
+    log.warn('Self-auth registration error (risuai not ready?)', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+  return false;
+}
+
 async function registerWithRetry(password: string): Promise<void> {
   const maxRetries = 10;
   const retryDelay = 3000;
 
   for (let i = 0; i < maxRetries; i++) {
-    try {
-      const body = JSON.stringify({
-        password,
-        publicKey: publicKeyJwk,
-      });
-
-      const resp = await fetch(`${UPSTREAM.protocol}//${UPSTREAM.host}/api/login`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body,
-      });
-
-      if (resp.ok) {
-        registered = true;
-        log.info('Self-auth registered with risuai');
-        return;
-      }
-
-      const errBody = await resp.text();
-      log.warn('Self-auth registration failed', { status: resp.status, body: errBody, attempt: i + 1 });
-    } catch (err) {
-      log.warn('Self-auth registration error (risuai not ready?)', {
-        error: err instanceof Error ? err.message : String(err),
-        attempt: i + 1,
-      });
-    }
-
+    if (await registerOnce(password)) return;
+    log.warn('Self-auth retry', { attempt: i + 1 });
     await new Promise((resolve) => setTimeout(resolve, retryDelay));
   }
 
@@ -122,6 +126,36 @@ export async function issueInternalToken(): Promise<string | null> {
  */
 export function isAuthReady(): boolean {
   return registered;
+}
+
+/**
+ * Re-attempt self-auth registration once.
+ * Useful when initial startup registration failed but risuai is now available.
+ */
+export async function retryAuth(): Promise<void> {
+  if (registered) return;
+
+  let password: string;
+  try {
+    password = fs.readFileSync(PASSWORD_PATH, 'utf-8').trim();
+  } catch {
+    log.warn('retryAuth: cannot read password file', { path: PASSWORD_PATH });
+    return;
+  }
+  if (!password) return;
+
+  // 키페어가 아직 없으면 생성 (첫 initAuth가 패스워드 읽기 전에 실패한 경우)
+  if (!privateKey || !publicKeyJwk) {
+    const kp = await crypto.subtle.generateKey(
+      { name: 'ECDSA', namedCurve: 'P-256' },
+      true,
+      ['sign', 'verify'],
+    );
+    privateKey = kp.privateKey;
+    publicKeyJwk = await crypto.subtle.exportKey('jwk', kp.publicKey);
+  }
+
+  await registerOnce(password);
 }
 
 /**
