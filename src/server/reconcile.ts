@@ -224,7 +224,7 @@ function reconcileChats(
       });
       compressColdStorage(coldPayload).then((compressed) => {
         writeToUpstream(`coldstorage/${uuid}`, compressed, authHeader);
-      }).catch(() => {});
+      }).catch((e) => { log.warn('reconcile: cold storage write failed', { uuid: uuid!, error: String(e) }); });
     }
 
     upsertChatSession(db, sessionWsId, characterWsId, uuid, i, sessionFields, hash, uuid ? `coldstorage/${uuid}` : null);

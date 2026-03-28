@@ -747,7 +747,7 @@ function storeChatsDuringHydration(
     if (messages.length > 0) {
       uuid = crypto.randomUUID();
       const coldPayload = JSON.stringify({ message: chat.message, hypaV2Data: chat.hypaV2Data, hypaV3Data: chat.hypaV3Data, scriptstate: chat.scriptstate, localLore: chat.localLore });
-      compressColdStorage(coldPayload).then((compressed) => writeToUpstream(`coldstorage/${uuid}`, compressed, authHeader)).catch(() => {});
+      compressColdStorage(coldPayload).then((compressed) => writeToUpstream(`coldstorage/${uuid}`, compressed, authHeader)).catch((e) => { log.warn('storeChats: cold storage write failed', { uuid: uuid!, error: String(e) }); });
     }
     const hash = messages.length > 0 ? crypto.createHash('sha256').update(JSON.stringify(messages)).digest('hex') : null;
     upsertChatSession(db, sessionWsId, characterWsId, uuid, i, sessionFields, hash, uuid ? `coldstorage/${uuid}` : null);
