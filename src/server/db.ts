@@ -456,6 +456,24 @@ export function getChatSessionByUuid(
   ).get(uuid);
 }
 
+export function updateColdStatus(
+  db: Database.Database,
+  sessionWsId: string,
+  status: 'pending' | null,
+): void {
+  prep(db,
+    'UPDATE chat_sessions SET __ws_cold_status = ? WHERE __ws_id = ?',
+  ).run(status, sessionWsId);
+}
+
+export function getPendingColdSessions(
+  db: Database.Database,
+): Array<{ __ws_id: string; uuid: string; __ws_character_id: string }> {
+  return prep<{ __ws_id: string; uuid: string; __ws_character_id: string }>(db,
+    'SELECT __ws_id, uuid, __ws_character_id FROM chat_sessions WHERE __ws_cold_status = \'pending\' AND __ws_deleted_at IS NULL AND uuid IS NOT NULL',
+  ).all();
+}
+
 export function softDeleteChatSessionsByCharacter(
   db: Database.Database,
   characterWsId: string,

@@ -2,14 +2,14 @@ import http from 'http';
 import crypto from 'crypto';
 import Database from 'better-sqlite3';
 import { RISU_AUTH_HEADER } from './config';
-import { bufferBody, forwardBuffered, writeToUpstream } from './proxy';
+import { bufferBody, forwardBuffered, writeColdStorageWithRetry } from './proxy';
 import { parseRisuSave, parseRemotePointer } from './parser';
 import { COLD_STORAGE_HEADER, isColdMarker } from './slim';
 import { compressColdStorage } from './cold-compat';
 import {
   generateId, upsertBlock, upsertCharacter, getCharacterByCharId,
   characterJsonToColumns, characterColumnsToJson,
-  upsertChatSession, insertChatMessages,
+  upsertChatSession, insertChatMessages, updateColdStatus,
   softDeleteChatSessionsByCharacter, softDeleteChatMessagesBySession,
   getChatSessionsByCharacter,
   getAssetByHash, linkCharacterAsset, softDeleteAssetMapByCharacter,
@@ -278,12 +278,17 @@ function storeChats(
         scriptstate: chat.scriptstate,
         localLore: chat.localLore,
       });
-      compressColdStorage(coldPayload).then((compressed) => {
-        writeToUpstream(`coldstorage/${uuid}`, compressed, authHeader);
-      }).catch((e) => { log.warn('write-handler: cold storage write failed', { uuid: uuid!, error: String(e) }); });
+      const capturedUuid = uuid;
+      const capturedWsId = sessionWsId;
+      compressColdStorage(coldPayload).then((compressed) =>
+        writeColdStorageWithRetry(capturedUuid, compressed, authHeader),
+      ).then((ok) => {
+        if (ok) updateColdStatus(db, capturedWsId, null);
+      }).catch((e) => { log.warn('write-handler: cold storage write failed', { uuid: capturedUuid, error: String(e) }); });
     }
 
     upsertChatSession(db, sessionWsId, characterWsId, uuid, i, sessionFields, hash, uuid ? `coldstorage/${uuid}` : null);
+    if (uuid) updateColdStatus(db, sessionWsId, 'pending');
 
     if (messages.length > 0) {
       insertChatMessages(db, sessionWsId, messages);

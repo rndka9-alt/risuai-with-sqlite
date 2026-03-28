@@ -6,6 +6,15 @@ import type Database from 'better-sqlite3';
  */
 export function dbMigrate(db: Database.Database): void {
   addFileListCacheLastUsed(db);
+  addChatSessionsColdStatus(db);
+}
+
+/** chat_sessions: add __ws_cold_status column for cold storage retry tracking */
+function addChatSessionsColdStatus(db: Database.Database): void {
+  const columns = db.pragma('table_info(chat_sessions)') as Array<{ name: string }>;
+  if (!columns.some((c) => c.name === '__ws_cold_status')) {
+    db.exec('ALTER TABLE chat_sessions ADD COLUMN __ws_cold_status TEXT');
+  }
 }
 
 /** file_list_cache: add last_used column (added after initial schema) */

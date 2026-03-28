@@ -10,7 +10,7 @@ import {
 import { parseRisuSave, parseRemoteFile, parseRemotePointer } from './parser';
 import { COLD_STORAGE_HEADER, isColdMarker } from './slim';
 import { compressColdStorage } from './cold-compat';
-import { writeToUpstream } from './proxy';
+import { writeColdStorageWithRetry } from './proxy';
 import { RisuSaveType } from '../shared/types';
 import { extractUsePlainFetch } from './proxy-config-state';
 import { streamRisuSave } from '../utils/streamRisuSave';
@@ -18,7 +18,7 @@ import * as log from './logger';
 
 // write-handler의 storeChats, extractAndLinkAssets를 재사용하기 위해
 // 향후 공통 모듈로 추출 예정. 일단 reconcile에서도 동일 로직 적용.
-import { upsertChatSession, insertChatMessages, linkCharacterAsset, getAssetByHash } from './db';
+import { upsertChatSession, insertChatMessages, updateColdStatus, linkCharacterAsset, getAssetByHash } from './db';
 
 /**
  * Reconcile database.bin blocks against SQLite.
@@ -222,12 +222,17 @@ function reconcileChats(
         scriptstate: chat.scriptstate,
         localLore: chat.localLore,
       });
-      compressColdStorage(coldPayload).then((compressed) => {
-        writeToUpstream(`coldstorage/${uuid}`, compressed, authHeader);
-      }).catch((e) => { log.warn('reconcile: cold storage write failed', { uuid: uuid!, error: String(e) }); });
+      const capturedUuid = uuid;
+      const capturedWsId = sessionWsId;
+      compressColdStorage(coldPayload).then((compressed) =>
+        writeColdStorageWithRetry(capturedUuid, compressed, authHeader),
+      ).then((ok) => {
+        if (ok) updateColdStatus(db, capturedWsId, null);
+      }).catch((e) => { log.warn('reconcile: cold storage write failed', { uuid: capturedUuid, error: String(e) }); });
     }
 
     upsertChatSession(db, sessionWsId, characterWsId, uuid, i, sessionFields, hash, uuid ? `coldstorage/${uuid}` : null);
+    if (uuid) updateColdStatus(db, sessionWsId, 'pending');
 
     if (messages.length > 0) {
       insertChatMessages(db, sessionWsId, messages);

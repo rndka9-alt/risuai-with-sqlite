@@ -186,6 +186,77 @@ export function writeToUpstream(
 }
 
 /**
+ * Promise-based write to upstream with retry.
+ * Rejects if all attempts fail.
+ */
+export function writeToUpstreamAsync(
+  filePath: string,
+  data: Buffer,
+  authHeader: string | undefined,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const headers: Record<string, string> = {
+      host: UPSTREAM.host,
+      [FILE_PATH_HEADER]: encodeFilePath(filePath),
+      'content-type': 'application/octet-stream',
+      'content-length': String(data.length),
+    };
+    if (authHeader) {
+      headers[RISU_AUTH_HEADER] = authHeader;
+    }
+
+    const proxyReq = http.request(
+      {
+        hostname: UPSTREAM.hostname,
+        port: UPSTREAM.port,
+        path: '/api/write',
+        method: 'POST',
+        headers,
+      },
+      (proxyRes) => {
+        proxyRes.resume();
+        if (proxyRes.statusCode! >= 200 && proxyRes.statusCode! < 300) {
+          resolve();
+        } else {
+          reject(new Error(`upstream ${proxyRes.statusCode}`));
+        }
+      },
+    );
+
+    proxyReq.end(data);
+    proxyReq.on('error', reject);
+  });
+}
+
+const COLD_RETRY_DELAYS = [1000, 2000, 4000];
+
+/**
+ * Compress and write cold storage with exponential backoff retry.
+ * Returns true on success, false if all attempts exhausted.
+ */
+export async function writeColdStorageWithRetry(
+  uuid: string,
+  compressed: Buffer,
+  authHeader: string | undefined,
+): Promise<boolean> {
+  const filePath = `coldstorage/${uuid}`;
+  for (let attempt = 0; attempt <= COLD_RETRY_DELAYS.length; attempt++) {
+    try {
+      await writeToUpstreamAsync(filePath, compressed, authHeader);
+      return true;
+    } catch (e) {
+      if (attempt < COLD_RETRY_DELAYS.length) {
+        log.warn('Cold storage write retry', { uuid, attempt: attempt + 1, error: String(e) });
+        await new Promise((r) => setTimeout(r, COLD_RETRY_DELAYS[attempt]));
+      } else {
+        log.error('Cold storage write exhausted retries', { uuid, error: String(e) });
+      }
+    }
+  }
+  return false;
+}
+
+/**
  * Forward a request to upstream, buffer the response, transform it,
  * then send the transformed body to the client.
  * Used in hydration path where we want to slim data before serving.

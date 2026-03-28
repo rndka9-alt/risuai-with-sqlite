@@ -17,7 +17,7 @@
  * ID 생성: lower(hex(randomblob(16))) — 32자 hex
  */
 
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 export const DDL = `
 
@@ -503,7 +503,11 @@ CREATE TABLE IF NOT EXISTS chat_sessions (
 
   -- Chat.bookmarkNames
   -- 북마크 이름 매핑. JSON {[chatId: string]: string}.
-  bookmark_names    TEXT DEFAULT '{}'
+  bookmark_names    TEXT DEFAULT '{}',
+
+  -- cold storage 업로드 상태. 'pending' = 미완료, NULL = 완료 또는 불필요.
+  -- 재시도 워커가 pending 행을 찾아 chat_messages로부터 페이로드를 재구성하여 업로드.
+  __ws_cold_status  TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_chat_sessions_character ON chat_sessions(__ws_character_id);

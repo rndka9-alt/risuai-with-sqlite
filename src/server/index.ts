@@ -9,7 +9,7 @@ import {
   getCharacterByCharId, getCharacterHash, getAllCharacterIds, upsertCharacter,
   characterJsonToColumns, characterColumnsToJson,
   getChatSessionByUuid, getChatSessionsByCharacter,
-  getChatMessagesBySession, upsertChatSession, insertChatMessages,
+  getChatMessagesBySession, upsertChatSession, insertChatMessages, updateColdStatus,
   softDeleteChatSessionsByCharacter, softDeleteChatMessagesBySession,
   upsertAsset, getAssetByHash, getAssetById, linkCharacterAsset, softDeleteAssetMapByCharacter,
   getAssetMapByCharacter,
@@ -24,7 +24,7 @@ import { parseRisuSave, parseRemoteFile, parseRemotePointer } from './parser';
 import { assembleRisuSave } from './assembler';
 import { HEAVY_FIELDS, COLD_STORAGE_HEADER, isColdMarker } from './slim';
 import { compressColdStorage } from './cold-compat';
-import { writeToUpstream } from './proxy';
+import { writeColdStorageWithRetry } from './proxy';
 import { handleWriteDatabase, handleWriteRemote } from './write-handler';
 import { handleRemoveAsset, handleRemoveFile } from './remove-handler';
 import { reconcileDatabaseBin, reconcileRemoteFile, reconcileDatabaseBinStreaming, captureDatabaseBinStreaming } from './reconcile';
@@ -37,6 +37,7 @@ import { RisuSaveType, toRisuSaveType, type HydrationState } from '../shared/typ
 import { getUsePlainFetch, extractUsePlainFetch } from './proxy-config-state';
 import { initAuth, isAuthReady, issueInternalToken, verifyClientAuth } from './auth';
 import { startPeriodicSync, runSync } from './periodic-sync';
+import { startColdRetryWorker } from './cold-retry';
 import type { SyncResult } from './periodic-sync';
 import { dbMigrate } from './dbMigrate';
 
@@ -747,10 +748,17 @@ function storeChatsDuringHydration(
     if (messages.length > 0) {
       uuid = crypto.randomUUID();
       const coldPayload = JSON.stringify({ message: chat.message, hypaV2Data: chat.hypaV2Data, hypaV3Data: chat.hypaV3Data, scriptstate: chat.scriptstate, localLore: chat.localLore });
-      compressColdStorage(coldPayload).then((compressed) => writeToUpstream(`coldstorage/${uuid}`, compressed, authHeader)).catch((e) => { log.warn('storeChats: cold storage write failed', { uuid: uuid!, error: String(e) }); });
+      const capturedUuid = uuid;
+      const capturedWsId = sessionWsId;
+      compressColdStorage(coldPayload).then((compressed) =>
+        writeColdStorageWithRetry(capturedUuid, compressed, authHeader),
+      ).then((ok) => {
+        if (ok) updateColdStatus(db, capturedWsId, null);
+      }).catch((e) => { log.warn('storeChats: cold storage write failed', { uuid: capturedUuid, error: String(e) }); });
     }
     const hash = messages.length > 0 ? crypto.createHash('sha256').update(JSON.stringify(messages)).digest('hex') : null;
     upsertChatSession(db, sessionWsId, characterWsId, uuid, i, sessionFields, hash, uuid ? `coldstorage/${uuid}` : null);
+    if (uuid) updateColdStatus(db, sessionWsId, 'pending');
     if (messages.length > 0) insertChatMessages(db, sessionWsId, messages);
   }
 }
@@ -1707,6 +1715,7 @@ function main(): void {
 
       // Start periodic sync (24h interval)
       startPeriodicSync(getDb);
+      startColdRetryWorker(getDb);
     })();
   });
 }
