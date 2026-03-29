@@ -27,6 +27,7 @@ import { compressColdStorage } from './cold-compat';
 import { writeColdStorageWithRetry } from './proxy';
 import { handleWriteDatabase, handleWriteRemote } from './write-handler';
 import { handleRemoveAsset, handleRemoveFile } from './remove-handler';
+import { deleteCharacter } from './delete-handler';
 import { reconcileDatabaseBin, reconcileRemoteFile, reconcileDatabaseBinStreaming, captureDatabaseBinStreaming } from './reconcile';
 import { streamCharacterJson } from '../utils/streamCharacterJson';
 import { parseColumnComments } from '../utils/parseColumnComments';
@@ -71,6 +72,7 @@ type Route =
   | { type: 'internal-sql-query' }
   | { type: 'internal-sync-status' }
   | { type: 'internal-sync-trigger' }
+  | { type: 'internal-character-delete' }
   | { type: 'passthrough' };
 
 function classifyRequest(req: http.IncomingMessage): Route {
@@ -126,6 +128,9 @@ function classifyRequest(req: http.IncomingMessage): Route {
   }
   if (url === '/_internal/sync/trigger' && req.method === 'POST') {
     return { type: 'internal-sync-trigger' };
+  }
+  if (url === '/_internal/character/delete' && req.method === 'POST') {
+    return { type: 'internal-character-delete' };
   }
 
   // Root HTML (for script injection)
@@ -1632,6 +1637,49 @@ function main(): void {
             res.writeHead(500, { 'content-type': 'application/json' });
             res.end(JSON.stringify({ error: message }));
           });
+        return;
+      }
+
+      case 'internal-character-delete': {
+        if (!isDbReady()) {
+          res.writeHead(503, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'DB not ready' }));
+          return;
+        }
+        let body = '';
+        req.on('data', (chunk: Buffer) => { body += chunk.toString(); });
+        req.on('end', () => {
+          try {
+            const parsed: unknown = JSON.parse(body);
+            if (typeof parsed !== 'object' || parsed === null || !('charId' in parsed)) {
+              res.writeHead(400, { 'content-type': 'application/json' });
+              res.end(JSON.stringify({ error: 'Missing "charId" field' }));
+              return;
+            }
+            const { charId } = parsed as { charId: string };
+            if (typeof charId !== 'string' || charId.trim().length === 0) {
+              res.writeHead(400, { 'content-type': 'application/json' });
+              res.end(JSON.stringify({ error: 'Invalid charId' }));
+              return;
+            }
+
+            deleteCharacter(getDb(), charId, storedAuthHeader)
+              .then((result) => {
+                const status = result.ok ? 200 : 404;
+                res.writeHead(status, { 'content-type': 'application/json' });
+                res.end(JSON.stringify(result));
+              })
+              .catch((err: unknown) => {
+                const message = err instanceof Error ? err.message : String(err);
+                log.error('Character delete failed', { charId, error: message });
+                res.writeHead(500, { 'content-type': 'application/json' });
+                res.end(JSON.stringify({ ok: false, charId, fileRemoved: false, error: message }));
+              });
+          } catch {
+            res.writeHead(400, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Invalid JSON' }));
+          }
+        });
         return;
       }
 
