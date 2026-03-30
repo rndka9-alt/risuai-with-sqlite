@@ -114,7 +114,7 @@ async function retrySession(
 
   const coldPayload = JSON.stringify({
     message: messageArray,
-    hypaV2Data: tryParseJson(sessionRow.hypa_v2),
+    hypaV2Data: sessionRow.hypa_v2 ? tryParseJson(sessionRow.hypa_v2) : undefined,
     hypaV3Data: sessionRow.hypa_v3 ? tryParseJson(sessionRow.hypa_v3) : undefined,
     scriptstate: tryParseJson(sessionRow.script_state),
     localLore: tryParseJson(sessionRow.local_lore),

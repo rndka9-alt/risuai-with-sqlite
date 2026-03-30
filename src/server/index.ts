@@ -269,7 +269,7 @@ function buildSlimJson(row: Record<string, unknown>): string {
       message: s.uuid
         ? [{ role: 'char', data: COLD_STORAGE_HEADER + s.uuid, time: Date.now() }]
         : [],
-      hypaV2Data: tryParse(s.hypa_v2),
+      hypaV2Data: s.hypa_v2 ? tryParse(s.hypa_v2) : undefined,
       hypaV3Data: s.hypa_v3 ? tryParse(s.hypa_v3) : undefined,
       scriptstate: tryParse(s.script_state),
       localLore: tryParse(s.local_lore),
@@ -730,7 +730,7 @@ function storeChatsDuringHydration(
     if (!chat || typeof chat !== 'object') continue;
     const sessionWsId = generateId(db);
     const sessionFields = {
-      hypa_v2: JSON.stringify(chat.hypaV2Data ?? {}),
+      hypa_v2: chat.hypaV2Data ? JSON.stringify(chat.hypaV2Data) : null,
       hypa_v3: chat.hypaV3Data ? JSON.stringify(chat.hypaV3Data) : null,
       script_state: JSON.stringify(chat.scriptstate ?? {}),
       local_lore: JSON.stringify(chat.localLore ?? []),
@@ -820,7 +820,7 @@ async function handleReadColdStorage(req: http.IncomingMessage, res: http.Server
       generationInfo: tryParse(m.generation_info),
       promptInfo: tryParse(m.prompt_info),
     })),
-    hypaV2Data: tryParse(session.hypa_v2),
+    hypaV2Data: session.hypa_v2 ? tryParse(session.hypa_v2) : undefined,
     hypaV3Data: session.hypa_v3 ? tryParse(session.hypa_v3) : undefined,
     scriptstate: tryParse(session.script_state),
     localLore: tryParse(session.local_lore),

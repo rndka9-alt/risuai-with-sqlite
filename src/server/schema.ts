@@ -429,8 +429,9 @@ CREATE TABLE IF NOT EXISTS chat_sessions (
 
   -- Chat.hypaV2Data
   -- HYPA v2 장기 메모리 데이터. JSON object.
+  -- NULL = 아직 HypaV2를 사용하지 않은 세션. RisuAI는 truthy 체크로 초기화 여부 판별.
   -- e.g. '{"chunks":[],"mainChunks":[],"lastMainChunkID":0}'
-  hypa_v2           TEXT DEFAULT '{}',
+  hypa_v2           TEXT,
 
   -- Chat.hypaV3Data
   -- HYPA v3 요약 기반 장기 메모리. JSON object.

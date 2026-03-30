@@ -230,7 +230,7 @@ function storeChats(
 
     const sessionWsId = generateId(db);
     const sessionFields = {
-      hypa_v2: JSON.stringify(chat.hypaV2Data ?? {}),
+      hypa_v2: chat.hypaV2Data ? JSON.stringify(chat.hypaV2Data) : null,
       hypa_v3: chat.hypaV3Data ? JSON.stringify(chat.hypaV3Data) : null,
       script_state: JSON.stringify(chat.scriptstate ?? {}),
       local_lore: JSON.stringify(chat.localLore ?? []),
