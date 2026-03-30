@@ -434,8 +434,9 @@ CREATE TABLE IF NOT EXISTS chat_sessions (
 
   -- Chat.hypaV3Data
   -- HYPA v3 요약 기반 장기 메모리. JSON object.
+  -- NULL = 아직 HypaV3를 사용하지 않은 세션. RisuAI는 falsy 체크로 초기화 여부 판별.
   -- e.g. '{"summaries":[]}'
-  hypa_v3           TEXT DEFAULT '{}',
+  hypa_v3           TEXT,
 
   -- Chat.scriptstate
   -- 이 세션의 CBS 스크립트 실행 상태. JSON {[key:string]: string|number|boolean}.

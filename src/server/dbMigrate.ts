@@ -7,6 +7,7 @@ import type Database from 'better-sqlite3';
 export function dbMigrate(db: Database.Database): void {
   addFileListCacheLastUsed(db);
   addChatSessionsColdStatus(db);
+  nullifyEmptyHypaV3(db);
 }
 
 /** chat_sessions: add __ws_cold_status column for cold storage retry tracking */
@@ -15,6 +16,12 @@ function addChatSessionsColdStatus(db: Database.Database): void {
   if (!columns.some((c) => c.name === '__ws_cold_status')) {
     db.exec('ALTER TABLE chat_sessions ADD COLUMN __ws_cold_status TEXT');
   }
+}
+
+/** chat_sessions: '{}' → NULL. RisuAI는 truthy 체크로 초기화 여부를 판별하므로
+ *  빈 객체는 "데이터 있음"으로 오인되어 toHypaV3Data({}) → .summaries.map() 크래시 유발. */
+function nullifyEmptyHypaV3(db: Database.Database): void {
+  db.exec("UPDATE chat_sessions SET hypa_v3 = NULL WHERE hypa_v3 = '{}'");
 }
 
 /** file_list_cache: add last_used column (added after initial schema) */

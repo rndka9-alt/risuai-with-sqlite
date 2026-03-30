@@ -270,7 +270,7 @@ function buildSlimJson(row: Record<string, unknown>): string {
         ? [{ role: 'char', data: COLD_STORAGE_HEADER + s.uuid, time: Date.now() }]
         : [],
       hypaV2Data: tryParse(s.hypa_v2),
-      hypaV3Data: tryParse(s.hypa_v3),
+      hypaV3Data: s.hypa_v3 ? tryParse(s.hypa_v3) : undefined,
       scriptstate: tryParse(s.script_state),
       localLore: tryParse(s.local_lore),
       folderId: s.folder_id,
@@ -731,7 +731,7 @@ function storeChatsDuringHydration(
     const sessionWsId = generateId(db);
     const sessionFields = {
       hypa_v2: JSON.stringify(chat.hypaV2Data ?? {}),
-      hypa_v3: JSON.stringify(chat.hypaV3Data ?? {}),
+      hypa_v3: chat.hypaV3Data ? JSON.stringify(chat.hypaV3Data) : null,
       script_state: JSON.stringify(chat.scriptstate ?? {}),
       local_lore: JSON.stringify(chat.localLore ?? []),
       folder_id: chat.folderId ?? null,
@@ -821,7 +821,7 @@ async function handleReadColdStorage(req: http.IncomingMessage, res: http.Server
       promptInfo: tryParse(m.prompt_info),
     })),
     hypaV2Data: tryParse(session.hypa_v2),
-    hypaV3Data: tryParse(session.hypa_v3),
+    hypaV3Data: session.hypa_v3 ? tryParse(session.hypa_v3) : undefined,
     scriptstate: tryParse(session.script_state),
     localLore: tryParse(session.local_lore),
   });
