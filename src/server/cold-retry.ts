@@ -98,7 +98,9 @@ async function retrySession(
     if (msg.name !== null) obj.name = msg.name;
     if (msg.time !== null) obj.time = msg.time;
     if (msg.chat_id !== null) obj.chatId = msg.chat_id;
-    if (msg.disabled !== null) obj.disabled = msg.disabled;
+    if (msg.disabled !== null) {
+      obj.disabled = msg.disabled === 'true' ? true : msg.disabled === 'false' ? false : msg.disabled;
+    }
     if (msg.is_comment) obj.isComment = true;
     if (msg.other_user) obj.otherUser = true;
     const genInfo = msg.generation_info;
